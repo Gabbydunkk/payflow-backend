@@ -20,14 +20,10 @@ import { withSpan } from "./lib/telemetry.ts";
  * objects carry the caller's payload: `body-parser` hangs the raw request body
  * off `err.body`, and pino serializes an error's own enumerable properties.
  * `KEEPER_SECRET` and anything else posted to the API must not reach a log
- * aggregator, so only the type, message, status and stack are kept.
+ * aggregator, so a fresh error carries only the original type, its message and
+ * stack, plus the HTTP status when the failure already has one.
  */
-export function loggableError(err: unknown): {
-  type: string;
-  message: string;
-  status?: number;
-  stack: string;
-} {
+export function loggableError(err: unknown): Error {
   const e = err instanceof Error ? err : new Error(String(err));
   const withStatus = e as Error & { status?: unknown; statusCode?: unknown };
   const status =
@@ -36,12 +32,14 @@ export function loggableError(err: unknown): {
       : typeof withStatus.status === "number"
         ? withStatus.status
         : undefined;
-  return {
-    type: e.name,
-    message: e.message,
-    ...(status === undefined ? {} : { status }),
-    stack: e.stack ?? "",
-  };
+  const safe: Error & { status?: number } = new Error(e.message);
+  // A fresh error, so nothing the caller left on the original — `body-parser`'s
+  // `err.body` above all — is enumerable for pino to copy into the log line.
+  // The prototype is carried over, which is what pino reports as `err.type`.
+  Object.setPrototypeOf(safe, Object.getPrototypeOf(e));
+  if (e.stack !== undefined) safe.stack = e.stack;
+  if (status !== undefined) safe.status = status;
+  return safe;
 }
 
 /**

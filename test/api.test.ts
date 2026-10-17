@@ -792,7 +792,13 @@ describe("express 5 error boundary", () => {
       // line is inspected, as a request line holds a live IncomingMessage.
       const boundary = lines.filter((args) => args[1] === "unhandled request error");
       assert.equal(boundary.length, 1);
-      assert.ok(!JSON.stringify(boundary[0]![0]).includes("do-not-log-me"));
+      const logged = (boundary[0]![0] as { err: Error & { body?: unknown } }).err;
+      assert.ok(logged);
+      assert.equal(logged.name, "SyntaxError");
+      // The parser hangs the raw body off its error; that must not survive.
+      assert.equal("body" in logged, false);
+      assert.ok(!logged.message.includes("do-not-log-me"));
+      assert.ok(!(logged.stack ?? "").includes("do-not-log-me"));
     } finally {
       mock.restoreAll();
       await srv.stop();
@@ -808,10 +814,13 @@ describe("express 5 error boundary", () => {
       expose: true,
     });
     const kept = loggableError(err);
-    assert.equal(kept.type, "SyntaxError");
+    assert.equal(kept.name, "SyntaxError");
     assert.equal(kept.message, "Unexpected end of JSON input");
-    assert.equal(kept.status, 400);
-    assert.ok(!JSON.stringify(kept).includes("do-not-log-me"));
+    // The status is a number and survives; the payload does not.
+    assert.equal((kept as Error & { status?: number }).status, 400);
+    assert.equal("body" in kept, false);
+    assert.equal("expose" in kept, false);
+    assert.ok(!(kept.stack ?? "").includes("do-not-log-me"));
   });
 
   test("answers a fixed shape and never echoes the failure", () => {
