@@ -71,7 +71,7 @@ const schema = z.object({
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
   // zod 4 moved URL validation from `z.string().url()` to the top-level
-  // `z.url()` format validator; the check it performs is the same.
+  // `z.url()` format validator, which validates through the WHATWG URL parser.
   OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
 

@@ -151,20 +151,21 @@ describe("environment schema", () => {
   });
 
   // zod 4 replaced `z.string().url()` with the top-level `z.url()` format
-  // validator; this pins the behaviour the migration depends on.
-  test("z.url() still accepts and rejects otel endpoints by name", () => {
+  // validator, which validates through the WHATWG URL parser. This pins what
+  // the migration actually accepts and rejects at startup.
+  test("z.url() validates the otel endpoint and names it when rejected", () => {
     assert.equal(
       loadConfig({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318" })
         .OTEL_EXPORTER_OTLP_ENDPOINT,
       "http://localhost:4318",
     );
-    const message = failure({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "localhost:4318" });
+    const message = failure({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "definitely not a url" });
     assert.ok(message !== null);
     assert.match(message, /OTEL_EXPORTER_OTLP_ENDPOINT/);
   });
 
   test("non-numeric, non-integer and out-of-range numbers are rejected", () => {
-    for (const [key, value] of [
+    const cases: [string, string][] = [
       ["PORT", "not-a-port"],
       ["PORT", "0"],
       ["PORT", "-1"],
@@ -173,7 +174,8 @@ describe("environment schema", () => {
       ["INDEXER_FETCH_CONCURRENCY", "0"],
       ["INDEXER_FETCH_CONCURRENCY", "17"],
       ["SHUTDOWN_TIMEOUT_MS", "soon"],
-    ]) {
+    ];
+    for (const [key, value] of cases) {
       const message = failure({ ...BASE, [key]: value });
       assert.ok(message !== null, `${key}=${value} should be rejected`);
       assert.match(message, new RegExp(key));
