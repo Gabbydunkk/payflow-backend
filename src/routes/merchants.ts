@@ -1,7 +1,36 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
-import { SECONDS_PER_MONTH, SECONDS_PER_YEAR } from "./helpers.ts";
-import type { ForecastResponse, MerchantSummary } from "./types.ts";
+import {
+  getMerchantSummary,
+  listMerchantChargesAfter,
+  listMerchantForecastMandates,
+  listMerchantSubscribers,
+  getMerchantChurn,
+  getMerchantRevenue,
+} from "../lib/queries.ts";
+import { churnBucketSize } from "../lib/churn.ts";
+import type {
+  ForecastResponse,
+  MerchantChurnResponse,
+  MerchantRevenueResponse,
+  MerchantSubscribersResponse,
+  MerchantSummary,
+} from "./types.ts";
+import {
+  DEFAULT_REVENUE_BUCKETS,
+  limitOf,
+  MAX_CHURN_BUCKETS,
+  MAX_REVENUE_BUCKETS,
+} from "./helpers.ts";
+import {
+  addressSchema,
+  bucketSchema,
+  daysSchema,
+  limitSchema,
+  present,
+  unixSecondsSchema,
+  validate,
+} from "./validate.ts";
 
 /**
  * Bounded LRU in-memory cache for merchant summaries.
@@ -56,50 +85,26 @@ export class MerchantSummaryCache {
 
 export const defaultMerchantSummaryCache = new MerchantSummaryCache();
 
-/** Revenue per token: sums from charges and active mandates, joined via plans. */
-function tokensOf(
-  db: DatabaseSync,
-  merchant: string,
-): { token: string; totalCollected: string; mrr: string }[] {
-  // A charge carries no token of its own; its mandate's plan does. Both
-  // series read as bigint so no sum round-trips through a JS number.
-  const collected = db.prepare(
-    `SELECT p.token AS token, COALESCE(SUM(CAST(c.amount AS INTEGER)), 0) AS total
-       FROM charges c
-       JOIN mandates m ON m.id = c.mandate_id
-       JOIN plans p ON p.id = m.plan_id
-      WHERE c.merchant = ?
-      GROUP BY p.token`,
-  );
-  collected.setReadBigInts(true);
-  const recurring = db.prepare(
-    // eslint-disable-next-line no-restricted-syntax
-    `SELECT p.token AS token,
-            COALESCE(SUM(CAST(m.amount AS INTEGER) * ${SECONDS_PER_MONTH} / m.period), 0) AS mrr
-       FROM mandates m
-       JOIN plans p ON p.id = m.plan_id
-      WHERE m.merchant = ? AND m.status = 'Active' AND m.period > 0
-      GROUP BY p.token`,
-  );
-  recurring.setReadBigInts(true);
+const DAY_S = 86_400;
+/** Rows read per query while streaming the charges CSV. */
+const CSV_PAGE = 500;
+/** Every token Payflow settles in has seven decimals, as XLM does. */
+const TOKEN_DECIMALS = 7n;
+const TOKEN_SCALE = 10n ** TOKEN_DECIMALS;
 
-  const tokens = new Map<string, { totalCollected: string; mrr: string }>();
-  for (const row of collected.all(merchant) as { token: string; total: bigint }[]) {
-    tokens.set(row.token, { totalCollected: String(row.total), mrr: "0" });
-  }
-  for (const row of recurring.all(merchant) as { token: string; mrr: bigint }[]) {
-    const entry = tokens.get(row.token) ?? { totalCollected: "0", mrr: "0" };
-    entry.mrr = String(row.mrr);
-    tokens.set(row.token, entry);
-  }
-  return [...tokens]
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-    .map(([token, sums]) => ({ token, ...sums }));
+/** A smallest-unit amount in token units with seven decimals: 12500000 → 1.2500000. */
+export function tokenUnits(raw: bigint): string {
+  const sign = raw < 0n ? "-" : "";
+  const abs = raw < 0n ? -raw : raw;
+  const fraction = (abs % TOKEN_SCALE).toString().padStart(Number(TOKEN_DECIMALS), "0");
+  return `${sign}${abs / TOKEN_SCALE}.${fraction}`;
 }
 
-const DAY_S = 86_400;
+const CSV_HEADER = "date,mandate,subscriber,gross,fee,net,tx_hash";
 /** Longest forecast horizon, to keep the arithmetic bounded. */
 const MAX_FORECAST_DAYS = 365;
+/** Buckets reported by the churn endpoint when the caller does not say. */
+const DEFAULT_CHURN_BUCKETS = 12;
 
 function daysOf(raw: unknown, fallback = 30): number {
   const n = Number(raw);
@@ -136,80 +141,179 @@ export function merchantsRouter(
   const r = Router();
 
   r.get("/merchants/:address/summary", (req, res) => {
-    const address = String(req.params.address);
-    const cacheKey = defaultToken ? `${address}:${defaultToken}` : address;
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const cacheKey = defaultToken ? `${address.value}:${defaultToken}` : address.value;
     const cached = cache.get(cacheKey);
     if (cached !== undefined) {
       res.json(cached);
       return;
     }
 
-    const active = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM mandates WHERE merchant = ? AND status = 'Active'",
-      )
-      .get(address) as { n: number };
-    const collected = db
-      .prepare(
-        "SELECT COALESCE(SUM(CAST(amount AS INTEGER)), 0) AS total, COUNT(*) AS n FROM charges WHERE merchant = ?",
-      )
-      .get(address) as { total: number; n: number };
-    // Recurring revenue, normalised from each mandate's own period: MRR over a
-    // 30-day month and ARR over a 365-day year. Integer division truncates,
-    // which is fine at base-unit (stroop) scale.
-    const recurring = db
-      .prepare(
-        // Only module-level constants are interpolated here; the address is a
-        // bound parameter, so no request data reaches the SQL text.
-        // eslint-disable-next-line no-restricted-syntax
-        `SELECT COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_MONTH} / period), 0) AS mrr,
-                COALESCE(SUM(CAST(amount AS INTEGER) * ${SECONDS_PER_YEAR} / period), 0) AS arr
-           FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
-      )
-      .get(address) as { mrr: number; arr: number };
-
-    // The flat totals stop at one token only when a default exists. Without
-    // TOKEN_ID they keep the previous all-token meaning.
-    const tokens = tokensOf(db, address);
-    const scoped = defaultToken
-      ? tokens.find((t) => t.token === defaultToken)
-      : undefined;
-
-    const body: MerchantSummary = {
-      merchant: address,
-      activeMandates: active.n,
-      totalCollected: defaultToken
-        ? (scoped?.totalCollected ?? "0")
-        : String(collected.total),
-      chargeCount: collected.n,
-      mrr: defaultToken ? (scoped?.mrr ?? "0") : String(recurring.mrr),
-      arr: String(recurring.arr),
-      tokens,
-    };
+    const body = getMerchantSummary(db, address.value, defaultToken);
     cache.set(cacheKey, body);
     res.json(body);
   });
 
+  /** The merchant's distinct subscribers, grouped by lifetime value. */
+  r.get("/merchants/:address/subscribers", (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const body: MerchantSubscribersResponse = {
+      merchant: address.value,
+      subscribers: listMerchantSubscribers(db, address.value, limitOf(limit.value)).map(
+        (sub) => ({ ...sub, totalCollected: sub.totalCollected.toString() }),
+      ),
+    };
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/churn?bucket=month`: how many mandates started
+   * and departed in each time bucket.
+   *
+   * `bucket` picks the period (`day`, `week` or `month`; `month` by default)
+   * and `limit` how many of the most recent buckets to report. The counts are
+   * bucketed by the ledger close time of each event, so they are the chain's
+   * own history rather than the indexer's view of it.
+   */
+  r.get("/merchants/:address/churn", (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
+    if (!bucket.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const body: MerchantChurnResponse = getMerchantChurn(
+      db,
+      address.value,
+      churnBucketSize(bucket.value),
+      Math.min(limitOf(limit.value, DEFAULT_CHURN_BUCKETS), MAX_CHURN_BUCKETS),
+    );
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/revenue?bucket=day|week&from=&to=`: what the
+   * merchant took in, what the protocol took and what was left, over time.
+   *
+   * The buckets are calendar periods in UTC, taken from the close time of
+   * the ledger each charge was emitted in, so the report is the chain's own
+   * history rather than the indexer's view of it. `from` and `to` bound the
+   * range in unix seconds; without them the report covers the merchant's
+   * whole history.
+   */
+  r.get("/merchants/:address/revenue", (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const bucket = validate(req, res, "bucket", bucketSchema.optional(), present(req.query.bucket));
+    if (!bucket.ok) return;
+    const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
+    if (!from.ok) return;
+    const to = validate(req, res, "to", unixSecondsSchema.optional(), present(req.query.to));
+    if (!to.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const body: MerchantRevenueResponse = getMerchantRevenue(
+      db,
+      address.value,
+      churnBucketSize(bucket.value),
+      from.value,
+      to.value,
+      limit.value === undefined
+        ? DEFAULT_REVENUE_BUCKETS
+        : Math.min(limit.value, MAX_REVENUE_BUCKETS),
+    );
+    res.json(body);
+  });
+
+  /**
+   * `GET /merchants/:address/charges.csv?from=&to=`: every settled charge
+   * for the merchant, oldest first, as a CSV download for accounting.
+   *
+   * `gross` is what the subscriber paid, `fee` the protocol's share and
+   * `net` what the merchant kept (gross − fee = net), each in token units
+   * with seven decimals and computed as bigint. `date` is the charge's
+   * ledger close time in ISO 8601 UTC. Rows are streamed a page at a time,
+   * so neither the response nor a single query grows with the history.
+   */
+  r.get("/merchants/:address/charges.csv", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
+    if (!from.ok) return;
+    const to = validate(req, res, "to", unixSecondsSchema.optional(), present(req.query.to));
+    if (!to.ok) return;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payflow-charges-${address.value}.csv"`,
+    );
+    res.write(`${CSV_HEADER}\r\n`);
+
+    let after: Parameters<typeof listMerchantChargesAfter>[2] = null;
+    for (;;) {
+      const rows = listMerchantChargesAfter(
+        db,
+        address.value,
+        after,
+        CSV_PAGE,
+        from.value === undefined ? undefined : from.value * 1000,
+        to.value === undefined ? undefined : to.value * 1000,
+      );
+      if (rows.length === 0) break;
+      let chunk = "";
+      for (const row of rows) {
+        const net = BigInt(row.amount);
+        const fee = BigInt(row.fee);
+        chunk += [
+          new Date(row.created_at).toISOString(),
+          row.mandate_id,
+          row.subscriber,
+          tokenUnits(net + fee),
+          tokenUnits(fee),
+          tokenUnits(net),
+          row.tx_hash,
+        ].join(",") + "\r\n";
+      }
+      // Respect backpressure from a slow client, and stop if it went away.
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => {
+          const done = (): void => {
+            res.off("drain", done);
+            res.off("close", done);
+            resolve();
+          };
+          res.on("drain", done);
+          res.on("close", done);
+        });
+      }
+      if (res.destroyed) return;
+      if (rows.length < CSV_PAGE) break;
+      after = rows[rows.length - 1]!;
+    }
+    res.end();
+  });
+
   /** Projected charges over the next `days`, net of the protocol fee. */
   r.get("/merchants/:address/forecast", (req, res) => {
-    const address = String(req.params.address);
-    const days = daysOf(req.query.days);
-    const from = Math.floor(Date.now() / 1000);
-    const to = from + days * DAY_S;
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
+    if (!days.ok) return;
 
-    const mandates = db
-      .prepare(
-        `SELECT amount, period, next_charge, charges_made, max_charges, fee_bps
-           FROM mandates WHERE merchant = ? AND status = 'Active' AND period > 0`,
-      )
-      .all(address) as {
-      amount: string;
-      period: number;
-      next_charge: number;
-      charges_made: number;
-      max_charges: number;
-      fee_bps: number;
-    }[];
+    const window = daysOf(days.value);
+    const from = Math.floor(Date.now() / 1000);
+    const to = from + window * DAY_S;
+
+    const mandates = listMerchantForecastMandates(db, address.value);
 
     let net = 0n;
     let counted = 0;
@@ -222,8 +326,8 @@ export function merchantsRouter(
     }
 
     const body: ForecastResponse = {
-      merchant: address,
-      days,
+      merchant: address.value,
+      days: window,
       from,
       to,
       forecast: net.toString(),

@@ -1,8 +1,19 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
+import { getPlanById, getPlanStats, listPlans } from "../lib/queries.ts";
 import type { TokenMetadataService } from "../lib/tokens.ts";
-import { limitOf, tokenFields } from "./helpers.ts";
-import type { PlanPage, PlanRow } from "./types.ts";
+import { encodeCursor, limitOf, tokenFields } from "./helpers.ts";
+import { sendApiError } from "./errors.ts";
+import {
+  addressSchema,
+  cursorSchema,
+  idSchema,
+  limitSchema,
+  present,
+  validate,
+} from "./validate.ts";
+import { z } from "zod";
+import type { PlanPage, PlanStatsResponse } from "./types.ts";
 
 /**
  * `GET /plans` and `GET /plans/:id`.
@@ -16,33 +27,86 @@ export function plansRouter(db: DatabaseSync, tokens: TokenMetadataService): Rou
   const r = Router();
 
   r.get("/plans", async (req, res) => {
-    const { merchant } = req.query;
-    const rows = merchant
-      ? db
-          .prepare("SELECT * FROM plans WHERE merchant = ? ORDER BY id DESC LIMIT ?")
-          .all(String(merchant), limitOf(req.query.limit))
-      : db
-          .prepare("SELECT * FROM plans ORDER BY id DESC LIMIT ?")
-          .all(limitOf(req.query.limit));
-    const plans = await Promise.all(
-      (rows as unknown as PlanRow[]).map(async (row) => ({
-        ...row,
-        ...(await tokenFields(tokens, row.token)),
-      })),
+    const merchant = validate(
+      req,
+      res,
+      "merchant",
+      addressSchema.optional(),
+      present(req.query.merchant),
     );
-    const body: PlanPage = { plans };
+    if (!merchant.ok) return;
+    const q = validate(
+      req,
+      res,
+      "q",
+      z.string().optional(),
+      present(req.query.q),
+    );
+    if (!q.ok) return;
+    const cursor = validate(
+      req,
+      res,
+      "cursor",
+      cursorSchema.optional(),
+      present(req.query.cursor),
+    );
+    if (!cursor.ok) return;
+    const limit = validate(req, res, "limit", limitSchema.optional(), present(req.query.limit));
+    if (!limit.ok) return;
+
+    const page = listPlans(db, {
+      merchant: merchant.value,
+      q: q.value,
+      cursor: cursor.value,
+      limit: limitOf(limit.value),
+    });
+    const plans = await Promise.all(
+      page.rows.map(async (row) => ({ ...row, ...(await tokenFields(tokens, row.token)) })),
+    );
+    const body: PlanPage = {
+      plans,
+      nextCursor: page.nextCursorId === null ? null : encodeCursor(page.nextCursorId),
+    };
     res.json(body);
   });
 
   r.get("/plans/:id", async (req, res) => {
-    const row = db
-      .prepare("SELECT * FROM plans WHERE id = ?")
-      .get(Number(req.params.id)) as unknown as PlanRow | undefined;
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+
+    const row = getPlanById(db, id.value);
     if (!row) {
-      res.status(404).json({ error: "plan_not_found" });
+      sendApiError(res, req, 404, "plan_not_found");
       return;
     }
-    res.json({ ...row, ...(await tokenFields(tokens, row.token)) });
+    const tokenId = row.token;
+    res.json({ ...row, ...(await tokenFields(tokens, tokenId)) });
+  });
+
+  /** `GET /plans/:id/stats`: active and total mandates, cancellations, gross
+   * collected, and average charges per mandate. */
+  r.get("/plans/:id/stats", (req, res) => {
+    const id = validate(req, res, "id", idSchema, req.params.id);
+    if (!id.ok) return;
+    const planId = id.value;
+
+    if (!getPlanById(db, planId)) {
+      sendApiError(res, req, 404, "plan_not_found");
+      return;
+    }
+    const stats = getPlanStats(db, planId);
+    const body: PlanStatsResponse = {
+      planId,
+      activeMandates: stats.activeMandates,
+      totalMandates: stats.totalMandates,
+      cancellations: stats.cancellations,
+      totalCollected: String(stats.totalCollected),
+      totalCharges: stats.totalCharges,
+      // A plan with no mandates has no average; report 0 rather than NaN.
+      averageChargesPerMandate:
+        stats.totalMandates === 0 ? 0 : stats.totalCharges / stats.totalMandates,
+    };
+    res.json(body);
   });
 
   return r;

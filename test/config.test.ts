@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { test, describe } from "node:test";
-import { loadConfig } from "../src/config.ts";
+import { readFileSync } from "node:fs";
+import { parseEnv } from "node:util";
+import { Keypair, StrKey } from "@stellar/stellar-sdk";
+import { loadConfig, networkConfigs } from "../src/config.ts";
 
 /** The minimum viable environment: contract ids pass the 56-char check. */
+const VALID_CONTRACT_ID = StrKey.encodeContract(Buffer.alloc(32));
 const BASE = {
-  PLAN_REGISTRY_ID: "C".repeat(56),
-  VAULT_ID: "C".repeat(56),
-  SUBSCRIPTION_ID: "C".repeat(56),
+  PLAN_REGISTRY_ID: VALID_CONTRACT_ID,
+  VAULT_ID: VALID_CONTRACT_ID,
+  SUBSCRIPTION_ID: VALID_CONTRACT_ID,
 };
 
 describe("soroban rpc endpoints", () => {
@@ -75,130 +79,272 @@ describe("keeper order", () => {
   });
 });
 
-describe("environment schema", () => {
-  test("loadConfig fills in the documented defaults", () => {
-    const config = loadConfig({ ...BASE });
-    assert.equal(config.STELLAR_NETWORK, "testnet");
-    assert.deepEqual(config.SOROBAN_RPC_URL, ["https://soroban-testnet.stellar.org"]);
-    assert.equal(config.NETWORK_PASSPHRASE, "Test SDF Network ; September 2015");
-    assert.equal(config.KEEPER_ENABLED, false);
-    assert.equal(config.KEEPER_INTERVAL_MS, 60_000);
-    assert.equal(config.INDEXER_INTERVAL_MS, 10_000);
-    assert.equal(config.INDEXER_START_LEDGER, 0);
-    assert.equal(config.INDEXER_FETCH_CONCURRENCY, 4);
-    assert.equal(config.PORT, 8080);
-    assert.equal(config.DATABASE_PATH, "./payflow.db");
-    assert.equal(config.CORS_ORIGIN, "*");
-    assert.equal(config.LOG_LEVEL, "info");
-    assert.equal(config.SHUTDOWN_TIMEOUT_MS, 15_000);
-    assert.equal(config.TOKEN_ID, undefined);
-    assert.equal(config.OTEL_EXPORTER_OTLP_ENDPOINT, undefined);
+describe("keeper merchants", () => {
+  const A = Keypair.random().publicKey();
+  const B = Keypair.random().publicKey();
+
+  test("defaults to empty, meaning every merchant", () => {
+    assert.deepEqual(loadConfig({ ...BASE }).KEEPER_MERCHANTS, []);
+    assert.deepEqual(loadConfig({ ...BASE, KEEPER_MERCHANTS: "" }).KEEPER_MERCHANTS, []);
   });
 
-  test("numeric variables are coerced from their env strings", () => {
-    const config = loadConfig({
-      ...BASE,
-      PORT: "9000",
-      KEEPER_INTERVAL_MS: "1500",
-      INDEXER_FETCH_CONCURRENCY: "1",
-      SHUTDOWN_TIMEOUT_MS: "500",
-    });
-    assert.equal(config.PORT, 9000);
-    assert.equal(config.KEEPER_INTERVAL_MS, 1500);
-    assert.equal(config.INDEXER_FETCH_CONCURRENCY, 1);
-    assert.equal(config.SHUTDOWN_TIMEOUT_MS, 500);
-  });
-
-  test("KEEPER_ENABLED is a boolean, not the string 'false'", () => {
-    assert.equal(loadConfig({ ...BASE }).KEEPER_ENABLED, false);
-    assert.equal(
-      loadConfig({ ...BASE, KEEPER_ENABLED: "true", KEEPER_SECRET: "S".repeat(56) })
-        .KEEPER_ENABLED,
-      true,
+  test("splits on commas, trimming blanks and duplicates", () => {
+    assert.deepEqual(
+      loadConfig({ ...BASE, KEEPER_MERCHANTS: ` ${A} ,,${B},${A}` }).KEEPER_MERCHANTS,
+      [A, B],
     );
   });
 
-  /** Runs loadConfig and returns the thrown message, or null when it succeeds. */
-  function failure(env: Record<string, string>): string | null {
-    try {
-      loadConfig(env);
-      return null;
-    } catch (err) {
-      return (err as Error).message;
-    }
-  }
+  test("rejects anything that is not an account address", () => {
+    assert.throws(() => loadConfig({ ...BASE, KEEPER_MERCHANTS: `${A},nope` }), /KEEPER_MERCHANTS/);
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_MERCHANTS: VALID_CONTRACT_ID }),
+      /KEEPER_MERCHANTS/,
+    );
+  });
+});
 
-  test("a missing contract id is named in the error", () => {
-    const message = failure({ PLAN_REGISTRY_ID: "C".repeat(56), VAULT_ID: "C".repeat(56) });
-    assert.ok(message !== null);
-    assert.match(message, /^Invalid environment configuration:/);
-    assert.match(message, /SUBSCRIPTION_ID/);
+describe("keeper channel secrets", () => {
+  test("defaults to no channels, so single-key setups are untouched", () => {
+    assert.deepEqual(loadConfig({ ...BASE }).KEEPER_CHANNEL_SECRETS, []);
   });
 
-  test("a malformed contract id is rejected with its length", () => {
-    const message = failure({ ...BASE, VAULT_ID: "too-short" });
-    assert.ok(message !== null);
-    assert.match(message, /VAULT_ID/);
-    // Same meaning as zod 3's "String must contain at least 56 character(s)".
-    assert.match(message, /56/);
+  test("a comma-separated list is split, trimmed and kept in order", () => {
+    const a = Keypair.random().secret();
+    const b = Keypair.random().secret();
+    assert.deepEqual(
+      loadConfig({ ...BASE, KEEPER_CHANNEL_SECRETS: ` ${a} , ${b}` }).KEEPER_CHANNEL_SECRETS,
+      [a, b],
+    );
   });
 
-  test("a bare host is rejected as an rpc url", () => {
-    const message = failure({ ...BASE, SOROBAN_RPC_URL: "soroban.local" });
-    assert.ok(message !== null);
-    assert.match(message, /SOROBAN_RPC_URL/);
-    assert.match(message, /URL/);
+  test("blanks between commas are dropped", () => {
+    const a = Keypair.random().secret();
+    assert.deepEqual(
+      loadConfig({ ...BASE, KEEPER_CHANNEL_SECRETS: `,${a},` }).KEEPER_CHANNEL_SECRETS,
+      [a],
+    );
   });
 
-  // zod 4 replaced `z.string().url()` with the top-level `z.url()` format
-  // validator, which validates through the WHATWG URL parser. This pins what
-  // the migration actually accepts and rejects at startup.
-  test("z.url() validates the otel endpoint and names it when rejected", () => {
+  test("anything that is not a Stellar secret seed is rejected", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_CHANNEL_SECRETS: "not-a-secret" }),
+      /KEEPER_CHANNEL_SECRETS/,
+    );
+    assert.throws(
+      () =>
+        loadConfig({
+          ...BASE,
+          KEEPER_CHANNEL_SECRETS: `${Keypair.random().secret()},GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH`,
+        }),
+      /KEEPER_CHANNEL_SECRETS/,
+      "a public key is not a signing secret",
+    );
+  });
+});
+
+describe("keeper inclusion fee configuration", () => {
+  test("uses the default percentile and cap", () => {
+    const config = loadConfig(env());
+    assert.equal(config.KEEPER_FEE_PERCENTILE, "90");
+    assert.equal(config.KEEPER_MAX_FEE, 100_000n);
+  });
+
+  test("rejects unsupported percentiles and fees below BASE_FEE", () => {
+    assert.throws(() => loadConfig(env({ KEEPER_FEE_PERCENTILE: "85" })), /KEEPER_FEE_PERCENTILE/);
+    assert.throws(() => loadConfig(env({ KEEPER_MAX_FEE: "1" })), /KEEPER_MAX_FEE/);
+  });
+});
+
+describe("keeper dry-run configuration", () => {
+  test("KEEPER_DRY_RUN defaults to off: a normal pass submits", () => {
+    assert.equal(loadConfig({ ...BASE }).KEEPER_DRY_RUN, false);
+    assert.equal(loadConfig({ ...BASE, KEEPER_DRY_RUN: "false" }).KEEPER_DRY_RUN, false);
+  });
+
+  test("KEEPER_DRY_RUN=true turns the rehearsal on", () => {
+    assert.equal(loadConfig({ ...BASE, KEEPER_DRY_RUN: "true" }).KEEPER_DRY_RUN, true);
+  });
+});
+
+const ID = VALID_CONTRACT_ID;
+
+/** Environment holding only what the default network needs. */
+function env(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
+  return {
+    PLAN_REGISTRY_ID: ID,
+    VAULT_ID: ID,
+    SUBSCRIPTION_ID: ID,
+    ...overrides,
+  };
+}
+
+describe("reconciliation", () => {
+  test("defaults to a ten-minute interval and a 25-mandate sample", () => {
+    const config = loadConfig(env());
+    assert.equal(config.RECONCILE_INTERVAL_MS, 600_000);
+    assert.equal(config.RECONCILE_SAMPLE_SIZE, 25);
+  });
+
+  test("rejects a non-positive interval and sample size", () => {
+    assert.throws(() => loadConfig(env({ RECONCILE_INTERVAL_MS: "0" })), /RECONCILE_INTERVAL_MS/);
+    assert.throws(() => loadConfig(env({ RECONCILE_INTERVAL_MS: "-1" })), /RECONCILE_INTERVAL_MS/);
+    assert.throws(() => loadConfig(env({ RECONCILE_SAMPLE_SIZE: "0" })), /RECONCILE_SAMPLE_SIZE/);
+  });
+});
+
+describe("network configs", () => {
+  test("with no NETWORKS there is exactly the default network", () => {
+    const config = loadConfig(env());
+    const networks = networkConfigs(config, env());
+    assert.equal(networks.length, 1);
+    assert.equal(networks[0]!.name, "testnet");
+    assert.equal(networks[0]!.databasePath, "./payflow.db");
+  });
+
+  test("an extra network is built from its prefixed variables", () => {
+    const overrides = {
+      NETWORKS: "mainnet",
+      DATABASE_PATH: "/data/payflow.db",
+      MAINNET_SOROBAN_RPC_URL: "https://mainnet.sorobanrpc.example",
+      MAINNET_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+      MAINNET_PLAN_REGISTRY_ID: ID,
+      MAINNET_VAULT_ID: ID,
+      MAINNET_SUBSCRIPTION_ID: ID,
+      MAINNET_INDEXER_START_LEDGER: "5110418",
+    };
+    const config = loadConfig(env(overrides));
+    const networks = networkConfigs(config, env(overrides));
+
+    assert.deepEqual(networks.map((n) => n.name), ["testnet", "mainnet"]);
+    const mainnet = networks[1]!;
+    assert.equal(mainnet.rpcUrl, overrides.MAINNET_SOROBAN_RPC_URL);
+    assert.equal(mainnet.startLedger, 5_110_418);
+    // The default path is a template so both databases sit side by side.
+    assert.equal(mainnet.databasePath, "/data/payflow-mainnet.db");
+  });
+
+  test("naming the default network in NETWORKS does not duplicate it", () => {
+    const overrides = { NETWORKS: "testnet, testnet" };
+    const config = loadConfig(env(overrides));
+    const networks = networkConfigs(config, env(overrides));
+    assert.equal(networks.length, 1);
+  });
+
+  test("a missing variable names the network and the variable", () => {
+    const overrides = { NETWORKS: "mainnet" };
+    const config = loadConfig(env(overrides));
+    assert.throws(
+      () => networkConfigs(config, env(overrides)),
+      /Invalid configuration for network "mainnet"[\s\S]*MAINNET_VAULT_ID/,
+    );
+  });
+
+  test("a name that is not a URL-safe segment is rejected", () => {
+    const overrides = { NETWORKS: "main net" };
+    const config = loadConfig(env(overrides));
+    assert.throws(
+      () => networkConfigs(config, env(overrides)),
+      /Invalid network name "main net"/,
+    );
+  });
+});
+
+describe("optional variables left blank", () => {
+  test("an empty OTLP endpoint means tracing is off, not a bad URL", () => {
+    // The shipped .env.example leaves the variable blank, and a container
+    // that reads that file must still start.
     assert.equal(
-      loadConfig({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318" })
+      loadConfig(env({ OTEL_EXPORTER_OTLP_ENDPOINT: "" })).OTEL_EXPORTER_OTLP_ENDPOINT,
+      undefined,
+    );
+    assert.equal(loadConfig(env()).OTEL_EXPORTER_OTLP_ENDPOINT, undefined);
+  });
+
+  test("a real endpoint is kept and a malformed one is rejected", () => {
+    assert.equal(
+      loadConfig(env({ OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318" }))
         .OTEL_EXPORTER_OTLP_ENDPOINT,
       "http://localhost:4318",
     );
-    const message = failure({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "definitely not a url" });
-    assert.ok(message !== null);
-    assert.match(message, /OTEL_EXPORTER_OTLP_ENDPOINT/);
+    assert.throws(
+      () => loadConfig(env({ OTEL_EXPORTER_OTLP_ENDPOINT: "not-a-url" })),
+      /OTEL_EXPORTER_OTLP_ENDPOINT/,
+    );
+  });
+});
+
+describe("the shipped .env.example", () => {
+  test("is a configuration the service can start with", () => {
+    // The file a new contributor copies is the one a container reads, so a
+    // blank value in it must not stop the process from starting.
+    const contents = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+    const config = loadConfig(parseEnv(contents));
+    assert.equal(
+      config.PLAN_REGISTRY_ID,
+      "CDQ5EJTVXXX2CBMHWP3BGGUDHSK6D4I25IF5XXH3QGL2TNTBMJUOFKDB",
+    );
+    assert.equal(config.KEEPER_ENABLED, false);
+    assert.equal(config.OTEL_EXPORTER_OTLP_ENDPOINT, undefined);
+  });
+});
+
+describe("Stellar identifier validation", () => {
+  test("accepts a valid contract id and secret seed", () => {
+    const secret = Keypair.random().secret();
+    const config = loadConfig({ ...BASE, KEEPER_SECRET: secret });
+    assert.equal(config.PLAN_REGISTRY_ID, VALID_CONTRACT_ID);
+    assert.equal(config.KEEPER_SECRET, secret);
   });
 
-  test("non-numeric, non-integer and out-of-range numbers are rejected", () => {
-    const cases: [string, string][] = [
-      ["PORT", "not-a-port"],
-      ["PORT", "0"],
-      ["PORT", "-1"],
-      ["INDEXER_INTERVAL_MS", "1.5"],
-      ["INDEXER_START_LEDGER", "-1"],
-      ["INDEXER_FETCH_CONCURRENCY", "0"],
-      ["INDEXER_FETCH_CONCURRENCY", "17"],
-      ["SHUTDOWN_TIMEOUT_MS", "soon"],
-    ];
-    for (const [key, value] of cases) {
-      const message = failure({ ...BASE, [key]: value });
-      assert.ok(message !== null, `${key}=${value} should be rejected`);
-      assert.match(message, new RegExp(key));
-    }
+  test("rejects a public key where a contract id is required", () => {
+    const publicKey = Keypair.random().publicKey();
+    assert.throws(
+      () => loadConfig({ ...BASE, PLAN_REGISTRY_ID: publicKey }),
+      /PLAN_REGISTRY_ID: must be a valid Stellar contract ID/,
+    );
   });
 
-  test("the error names variables but never their values", () => {
-    const secret = "SABCdef456SECRETvalue";
-    const message = failure({
-      ...BASE,
-      KEEPER_SECRET: secret,
-      PORT: "-1",
-      SOROBAN_RPC_URL: "https://user:password@soroban.local,not-a-url",
-    });
-    assert.ok(message !== null);
-    assert.ok(message.includes("PORT"));
-    assert.ok(!message.includes(secret), "the keeper secret must never be echoed");
-    assert.ok(!message.includes("-1"), "the offending value must not be echoed");
-    assert.ok(!message.includes("password"), "url credentials must not be echoed");
+  test("rejects a malformed contract id and names the variable", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, VAULT_ID: "C".repeat(56) }),
+      /VAULT_ID: must be a valid Stellar contract ID/,
+    );
   });
 
-  test("enabling the keeper without a secret fails", () => {
-    const message = failure({ ...BASE, KEEPER_ENABLED: "true" });
-    assert.equal(message, "KEEPER_ENABLED=true requires KEEPER_SECRET to be set");
+  test("rejects malformed keeper secrets without echoing them", () => {
+    const secret = "S".repeat(56);
+    assert.throws(
+      () => loadConfig({ ...BASE, KEEPER_SECRET: secret }),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /KEEPER_SECRET: must be a valid Stellar secret seed/);
+        assert.equal(error.message.includes(secret), false);
+        return true;
+      },
+    );
+  });
+
+  test("rejects non-string identifiers without including their values", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, SUBSCRIPTION_ID: 123 as unknown as string }),
+      /SUBSCRIPTION_ID: Invalid input/,
+    );
+  });
+});
+
+// zod 4 replaced `z.string().url()` with the top-level `z.url()` format
+// validator, which validates through the WHATWG URL parser. This pins what the
+// migration accepts and rejects at startup.
+describe("zod 4 url validation", () => {
+  test("z.url() accepts the otel endpoint and names it when rejected", () => {
+    assert.equal(
+      loadConfig({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318" }).OTEL_EXPORTER_OTLP_ENDPOINT,
+      "http://localhost:4318",
+    );
+    assert.throws(
+      () => loadConfig({ ...BASE, OTEL_EXPORTER_OTLP_ENDPOINT: "definitely not a url" }),
+      /OTEL_EXPORTER_OTLP_ENDPOINT/,
+    );
   });
 });

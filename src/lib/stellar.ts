@@ -1,6 +1,6 @@
 import { rpc, scValToNative, xdr } from "@stellar/stellar-sdk";
 import type { Account, FeeBumpTransaction, Transaction } from "@stellar/stellar-sdk";
-import type { Config } from "../config.ts";
+import type { Config, NetworkConfig } from "../config.ts";
 import { logger } from "./logger.ts";
 import { traceRpc } from "./telemetry.ts";
 import eventSpecFile from "./event_spec.json" with { type: "json" };
@@ -12,11 +12,14 @@ export type RpcLike = Pick<
   | "getHealth"
   | "getEvents"
   | "getAccount"
+  | "getFeeStats"
   | "prepareTransaction"
   | "sendTransaction"
   | "getTransaction"
   /** Read-only contract calls; token metadata (symbol/name/decimals) uses them. */
   | "simulateTransaction"
+  /** Account entries (signers, thresholds) for SEP-10 sign-in. */
+  | "getLedgerEntries"
 >;
 
 /** Where failover currently stands; reported by /health. */
@@ -29,6 +32,14 @@ export interface RpcStatus {
 
 /** Obtains a server handle for a URL; injectable so tests can fake endpoints. */
 export type Dial = (url: string) => RpcLike;
+
+/** A full-history archive able to re-serve a ledger range the RPC no longer
+ * keeps. Only `getEvents` is needed; the archive is expected to answer the
+ * same shape as Soroban RPC (`startLedger`, `endLedger`, `limit`, `cursor`).
+ */
+export interface Archive {
+  getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse>;
+}
 
 /**
  * Hung endpoints must become errors, not promises that never settle, or
@@ -150,6 +161,10 @@ export class FailoverRpc implements RpcStatus {
     return this.run("getAccount", (server) => server.getAccount(address));
   }
 
+  async getFeeStats(): Promise<rpc.Api.GetFeeStatsResponse> {
+    return this.run("getFeeStats", (server) => server.getFeeStats());
+  }
+
   async prepareTransaction(
     tx: Transaction | FeeBumpTransaction,
     useUpgradedAuth?: boolean,
@@ -179,10 +194,57 @@ export class FailoverRpc implements RpcStatus {
   ): Promise<rpc.Api.SimulateTransactionResponse> {
     return this.run("simulateTransaction", (server) => server.simulateTransaction(tx));
   }
+
+  /**
+   * Ledger entries by key. A missing entry is absent from `entries` rather
+   * than an error, so a caller can tell "does not exist" from an outage —
+   * which `getAccountEntry` cannot, since it turns both into one error.
+   */
+  async getLedgerEntries(...keys: xdr.LedgerKey[]): Promise<rpc.Api.GetLedgerEntriesResponse> {
+    return this.run("getLedgerEntries", (server) => server.getLedgerEntries(...keys));
+  }
 }
 
-export function makeRpc(config: Config, dial: Dial = defaultDial): FailoverRpc {
-  return new FailoverRpc(config.SOROBAN_RPC_URL, dial);
+/**
+ * A full-history archive reachable over HTTP. It must answer the same
+ * `getEvents` shape as Soroban RPC (`startLedger`, `endLedger`, `limit`,
+ * `cursor`) so the indexer can backfill a gap it cannot reach through RPC.
+ * The archive is only asked for events in a bounded range, and filters are
+ * not forwarded: the archive serves everything in the range and the indexer
+ * applies only the contract events it understands, ignoring the rest.
+ */
+export class HttpArchive implements Archive {
+  private readonly url: string;
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  async getEvents(request: rpc.Api.GetEventsRequest): Promise<rpc.Api.GetEventsResponse> {
+    const url = new URL(this.url);
+    url.searchParams.set("startLedger", String(request.startLedger));
+    if (request.endLedger !== undefined) url.searchParams.set("endLedger", String(request.endLedger));
+    if (request.limit !== undefined) url.searchParams.set("limit", String(request.limit));
+    if (request.cursor) url.searchParams.set("cursor", request.cursor);
+    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(RPC_TIMEOUT_MS) });
+    if (!res.ok) throw new Error(`archive ${this.url} responded ${res.status}`);
+    return (await res.json()) as rpc.Api.GetEventsResponse;
+  }
+}
+
+export function makeRpc(
+  target: Config | NetworkConfig | { SOROBAN_RPC_URL: string[] } | { rpcUrl: string },
+  dial: Dial = defaultDial,
+): FailoverRpc {
+  let urls: string[] = [];
+  if ("SOROBAN_RPC_URL" in target && Array.isArray(target.SOROBAN_RPC_URL)) {
+    urls = target.SOROBAN_RPC_URL;
+  } else if ("rpcUrls" in target && Array.isArray((target as { rpcUrls: string[] }).rpcUrls)) {
+    urls = (target as { rpcUrls: string[] }).rpcUrls;
+  } else if ("rpcUrl" in target && typeof target.rpcUrl === "string") {
+    urls = target.rpcUrl.split(",").map((s) => s.trim()).filter(Boolean);
+  }
+  return new FailoverRpc(urls, dial);
 }
 
 /** A contract event flattened into plain JS values. */
@@ -196,6 +258,34 @@ export interface DecodedEvent {
   topics: unknown[];
   /** Non-topic fields. The macro emits these as a map by default. */
   data: Record<string, unknown>;
+  /**
+   * Close time of the ledger the event was emitted in, as unix seconds.
+   *
+   * This is the chain's own clock, not the indexer's wall clock, so a metric
+   * bucketed by it (see `lib/churn.ts`) is the same whether the event was
+   * indexed live or on a replay. `null` when the RPC did not report one.
+   *
+   * Optional so a hand-built event in a test need not name a time; the
+   * decoder always sets it.
+   */
+  closeTime?: number | null;
+}
+
+/** Helper to parse a ledger close time into unix epoch seconds. */
+export function parseCloseTime(raw: unknown): number | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === "number") {
+    return raw > 1e11 ? Math.floor(raw / 1000) : raw;
+  }
+  if (typeof raw === "string") {
+    const asNum = Number(raw);
+    if (!Number.isNaN(asNum) && asNum > 0) {
+      return asNum > 1e11 ? Math.floor(asNum / 1000) : asNum;
+    }
+    const parsed = Date.parse(raw);
+    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
+  }
+  return null;
 }
 
 /** Field types used by `event_spec.json`, mirroring the Soroban spec. */
@@ -350,6 +440,9 @@ export function decodeEvent(raw: rpc.Api.EventResponse): DecodedEvent | null {
       txHash: raw.txHash,
       topics: rest,
       data,
+      // The ledger's close time, so downstream projections can bucket events
+      // by the chain's clock rather than by when the indexer happened to run.
+      closeTime: parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
     };
   } catch {
     return null;

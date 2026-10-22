@@ -8,13 +8,26 @@ on:
   # Lets the auto-merge workflow run CI on main after it merges a PR.
   workflow_dispatch:
 
+# Every job below only reads the repository: it checks the code out and runs
+# a command against it. Nothing here writes to the repository, the API or the
+# package registry, so the token gets read-only access to the contents and
+# nothing else. Any permission that is not listed is set to none.
+#
+# The npm cache is not affected by this: it is written through the runner's
+# own cache token, not through GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -24,9 +37,12 @@ jobs:
   typecheck:
     name: typecheck
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
@@ -43,22 +59,92 @@ jobs:
         # finds upgrade breakage before a deployment does (node:sqlite needs 22.5+).
         node-version: ["22", "24"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
       - run: npm test
 
+  # Runs the tests with Node's own coverage and fails the job when the
+  # coverage falls below the threshold the script sets. The report is
+  # uploaded so a reviewer can see what the run measured.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    # Check the code out and read it. The report is written to the
+    # workspace and uploaded as an artifact; nothing else is written.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: measure coverage and enforce the threshold
+        run: npm run test:coverage
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+
+  # Fails on high and critical advisories in production dependencies. Dev
+  # advisories do not fail the job, and Dependabot keeps both current.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    # Check the code out and read it. The audit talks to the npm registry,
+    # not to the repository, so it needs no permission of its own.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+
   build:
     name: build
     runs-on: ubuntu-latest
+    # Check the code out and read it. Nothing else.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: npm
       - run: npm ci
       - run: npm run build
+
+  # Builds the image the way a deployment would, and pushes nothing: the
+  # build is the check, the release workflow publishes the image. A Dockerfile
+  # that no longer builds is a broken deployment path, and this is where that
+  # is caught.
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    # Check the code out and build the image from it. The build pushes
+    # nothing, so it needs no permission beyond reading the source: the
+    # build cache is written through the runner's own cache token.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: payflow-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

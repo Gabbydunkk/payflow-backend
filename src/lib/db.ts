@@ -8,9 +8,33 @@ import { DatabaseSync } from "node:sqlite";
  * ledger range twice must not change the result.
  *
  * `charges` is an append-only log keyed on (tx_hash, mandate_id) so a replayed
- * ledger cannot double-count revenue.
+ * ledger cannot double-count revenue. `created_at` is the charge's own time:
+ * the close time of the ledger it was emitted in, in unix milliseconds. It is
+ * the chain's clock, not the indexer's, so a report bucketed by it is the
+ * same whether the charge was indexed live or on a backfill.
+ *
+ * `mandate_events` is the churn log: one row per mandate per lifecycle event
+ * (started, cancelled, ended, completed), stamped with the ledger close time
+ * of the event. It is keyed on (mandate_id, slot) and written with
+ * INSERT OR IGNORE, so replaying a ledger range cannot record the same
+ * event — or the same departure — twice.
  */
 const SCHEMA = `
+
+-- Keep the original XDR payload even when the current decoder does not
+-- understand it. The RPC event ID is stable across overlapping windows.
+CREATE TABLE IF NOT EXISTS events (
+  event_id    TEXT PRIMARY KEY,
+  contract_id TEXT NOT NULL,
+  ledger      INTEGER NOT NULL,
+  tx_hash     TEXT NOT NULL,
+  event_index TEXT NOT NULL,
+  topics      TEXT NOT NULL,
+  data        TEXT NOT NULL,
+  close_time  INTEGER
+);
+CREATE INDEX IF NOT EXISTS events_ledger ON events(ledger, event_id);
+
 CREATE TABLE IF NOT EXISTS cursor (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   last_ledger  INTEGER NOT NULL
@@ -59,6 +83,9 @@ CREATE TABLE IF NOT EXISTS charges (
   charges_made INTEGER NOT NULL,
   next_charge  INTEGER NOT NULL,
   ledger       INTEGER NOT NULL,
+  -- When the charge happened: the close time of its ledger, in unix
+  -- milliseconds. The chain's clock, so a backfill stores the same value a
+  -- live index would have.
   created_at   INTEGER NOT NULL,
   PRIMARY KEY (tx_hash, mandate_id)
 );
@@ -78,6 +105,117 @@ CREATE TABLE IF NOT EXISTS vault_events (
   PRIMARY KEY (tx_hash, kind, user, amount)
 );
 CREATE INDEX IF NOT EXISTS vault_events_user ON vault_events(user);
+CREATE INDEX IF NOT EXISTS vault_events_user_token_ledger
+  ON vault_events(user, token, ledger DESC);
+CREATE INDEX IF NOT EXISTS vault_events_user_ledger
+  ON vault_events(user, ledger DESC);
+
+CREATE TABLE IF NOT EXISTS fee_history (
+  tx_hash      TEXT    PRIMARY KEY,
+  old_fee_bps  INTEGER NOT NULL,
+  new_fee_bps  INTEGER NOT NULL,
+  ledger       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fee_history_ledger ON fee_history(ledger DESC);
+
+-- One row per mandate per lifecycle event, used by the merchant churn
+-- endpoint. The "at" column is the ledger close time of the event in unix
+-- seconds, so buckets follow the chain's clock rather than the indexer's
+-- wall clock.
+--
+-- The "slot" column is 'start' or 'departure' and is part of the primary key,
+-- so a mandate has exactly one start and at most one departure however many
+-- times the event is applied. That is what makes the churn report's net
+-- figure correct by construction: a mandate can never be counted as leaving
+-- twice.
+CREATE TABLE IF NOT EXISTS mandate_events (
+  mandate_id INTEGER NOT NULL,
+  slot       TEXT    NOT NULL,
+  merchant   TEXT    NOT NULL,
+  kind       TEXT    NOT NULL,
+  at         INTEGER NOT NULL,
+  ledger     INTEGER NOT NULL,
+  PRIMARY KEY (mandate_id, slot)
+);
+CREATE INDEX IF NOT EXISTS mandate_events_merchant ON mandate_events(merchant, kind, at);
+
+-- Full mandate timeline is separate from mandate_events: that existing table
+-- aggregates churn into one start/departure slot and must retain its semantics.
+CREATE TABLE IF NOT EXISTS mandate_timeline (
+  mandate_id INTEGER NOT NULL,
+  tx_hash TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ledger INTEGER NOT NULL,
+  at INTEGER,
+  details TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (mandate_id, tx_hash, kind)
+);
+CREATE INDEX IF NOT EXISTS mandate_timeline_order ON mandate_timeline(mandate_id, ledger, tx_hash, kind);
+
+CREATE TABLE IF NOT EXISTS webhooks (
+  id          INTEGER PRIMARY KEY,
+  merchant    TEXT    NOT NULL,
+  url         TEXT    NOT NULL,
+  secret      TEXT    NOT NULL,
+  -- The secret a rotation replaced; it signs beside the new one until
+  -- previous_secret_expires_at (unix seconds).
+  previous_secret TEXT,
+  previous_secret_expires_at INTEGER,
+  active      INTEGER NOT NULL DEFAULT 1,
+  failed      INTEGER NOT NULL DEFAULT 0,
+  failures    INTEGER NOT NULL DEFAULT 0,
+  last_attempt INTEGER,
+  last_status INTEGER,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhooks_merchant ON webhooks(merchant);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id             INTEGER PRIMARY KEY,
+  webhook_id     INTEGER NOT NULL,
+  event_id       TEXT    NOT NULL,
+  idempotency_key TEXT   NOT NULL,
+  attempt        INTEGER NOT NULL,
+  status         TEXT    NOT NULL,   -- 'pending' | 'delivered' | 'failed'
+  http_status    INTEGER,
+  response_body  TEXT,
+  error          TEXT,
+  payload        TEXT    NOT NULL,
+  retry_at       INTEGER NOT NULL,
+  created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_webhook ON webhook_deliveries(webhook_id);
+CREATE INDEX IF NOT EXISTS webhook_deliveries_due ON webhook_deliveries(status, retry_at);
+
+-- Delivery history: one row per HTTP attempt, so a delivery that failed and
+-- then succeeded shows both. Pruned to the newest 100 rows per webhook on
+-- every insert; the index serves both the prune and the newest-first read.
+CREATE TABLE IF NOT EXISTS webhook_attempts (
+  id            INTEGER PRIMARY KEY,
+  webhook_id    INTEGER NOT NULL,
+  delivery_id   INTEGER NOT NULL,
+  event_id      TEXT    NOT NULL,
+  attempt       INTEGER NOT NULL,
+  status        TEXT    NOT NULL,   -- the delivery's status after the attempt
+  http_status   INTEGER,
+  error         TEXT,
+  next_retry_at INTEGER,
+  attempted_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS webhook_attempts_webhook ON webhook_attempts(webhook_id, id);
+
+-- Contract upgrade history. Records when contracts are upgraded with new code.
+CREATE TABLE IF NOT EXISTS contract_upgrades (
+  contract_id TEXT    NOT NULL,
+  tx_hash     TEXT    NOT NULL,
+  ledger      INTEGER NOT NULL,
+  close_time  INTEGER NOT NULL,
+  new_hash    TEXT    NOT NULL,
+  old_hash    TEXT,
+  PRIMARY KEY (contract_id, ledger, tx_hash)
+);
+CREATE INDEX IF NOT EXISTS contract_upgrades_contract ON contract_upgrades(contract_id, ledger DESC);
+CREATE INDEX IF NOT EXISTS contract_upgrades_ledger ON contract_upgrades(ledger DESC);
 `;
 
 /**
@@ -89,6 +227,8 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
   ["plans", "name", "TEXT NOT NULL DEFAULT ''"],
   ["mandates", "fee_bps", "INTEGER NOT NULL DEFAULT 0"],
   ["mandates", "ended_by", "TEXT"],
+  ["webhooks", "previous_secret", "TEXT"],
+  ["webhooks", "previous_secret_expires_at", "INTEGER"],
 ];
 
 /**
@@ -102,6 +242,10 @@ const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string
   ["mandates", "mandates_merchant_status_period_amount", "merchant, status, period, amount"],
   ["charges", "charges_merchant_amount", "merchant, amount"],
   ["charges", "charges_subscriber_amount_fee", "subscriber, amount, fee"],
+  // The merchant revenue report reads one merchant's charges in a time range
+  // and buckets them by their close time, so the range filter is served from
+  // the index rather than from a scan of the merchant's whole history.
+  ["charges", "charges_merchant_created_at", "merchant, created_at"],
 ];
 
 export function migrate(db: DatabaseSync): void {
@@ -146,4 +290,52 @@ export function writeCursor(db: DatabaseSync, ledger: number): void {
     `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
      ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
   ).run(ledger);
+}
+
+/** Store the XDR representation without converting monetary values to JS numbers. */
+export interface StoredContractEvent {
+  eventId: string;
+  contractId: string;
+  ledger: number;
+  txHash: string;
+  eventIndex: string;
+  topics: string;
+  data: string;
+  closeTime: number | null;
+}
+
+export interface ContractUpgrade {
+  contractId: string;
+  txHash: string;
+  ledger: number;
+  closeTime: number;
+  newHash: string;
+  oldHash?: string | undefined;
+}
+
+export function saveContractEvent(db: DatabaseSync, event: StoredContractEvent): void {
+  db.prepare(`INSERT OR IGNORE INTO events
+    (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    event.eventId, event.contractId, event.ledger, event.txHash,
+    event.eventIndex, event.topics, event.data, event.closeTime,
+  );
+}
+
+export function saveContractUpgrade(db: DatabaseSync, upgrade: ContractUpgrade): void {
+  db.prepare(`INSERT OR IGNORE INTO contract_upgrades
+    (contract_id, tx_hash, ledger, close_time, new_hash, old_hash)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(
+    upgrade.contractId, upgrade.txHash, upgrade.ledger, upgrade.closeTime,
+    upgrade.newHash, upgrade.oldHash ?? null,
+  );
+}
+
+export function clearProjections(db: DatabaseSync): void {
+  // Do not remove cursor, raw events, or operational webhook configuration.
+  for (const table of [
+    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline", "contract_upgrades",
+  ]) {
+    db.exec(`DELETE FROM ${table}`);
+  }
 }

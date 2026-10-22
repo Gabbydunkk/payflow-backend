@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { TokenMetadataUnavailable, type TokenMetadataService } from "../lib/tokens.ts";
 import { logger } from "../lib/logger.ts";
+import { sendApiError } from "./errors.ts";
 import type { TokenMetadata } from "./types.ts";
 
 /** Contract ids are strkey-encoded ed25519 addresses; `native` is also accepted. */
@@ -18,7 +19,7 @@ export function tokensRouter(tokens: TokenMetadataService): Router {
   r.get("/tokens/:id", async (req, res) => {
     const id = String(req.params.id);
     if (!TOKEN_ID.test(id)) {
-      res.status(400).json({ error: "invalid_token_id" });
+      sendApiError(res, req, 400, "invalid_token_id");
       return;
     }
 
@@ -29,7 +30,7 @@ export function tokensRouter(tokens: TokenMetadataService): Router {
       if (err instanceof TokenMetadataUnavailable) {
         // Transient by definition: the next request reads the contract again.
         logger.warn({ token: id, reason: err.reason }, "token metadata unavailable");
-        res.status(502).json({ error: "token_metadata_unavailable" });
+        sendApiError(res, req, 502, "token_metadata_unavailable");
         return;
       }
       throw err;

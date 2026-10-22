@@ -117,13 +117,13 @@ describe("GET /api/tokens/:id", () => {
   test("a malformed contract id is a 400", async () => {
     const { status, body } = await get("/api/tokens/not-a-token");
     assert.equal(status, 400);
-    assert.equal(body.error, "invalid_token_id");
+    assert.equal((body.error as unknown as { code: string }).code, "invalid_token_id");
   });
 
   test("an unreadable token is a 502 and is retried next request", async () => {
     const first = await get(`/api/tokens/${UNKNOWN}`);
     assert.equal(first.status, 502);
-    assert.equal(first.body.error, "token_metadata_unavailable");
+    assert.equal((first.body.error as unknown as { code: string }).code, "token_metadata_unavailable");
     const n = reads;
     await get(`/api/tokens/${UNKNOWN}`);
     assert.ok(reads > n, "a failed read is not cached, so the next call retries");

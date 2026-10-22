@@ -82,6 +82,17 @@ export interface ChargeRow {
   created_at: number;
 }
 
+/** A due mandate as the projection holds it; its plan names the token. */
+export interface DueMandateRecord {
+  id: number;
+  subscriber: string;
+  merchant: string;
+  next_charge: number;
+  amount: string;
+  /** The plan the mandate was opened against; its token names the vault balance. */
+  plan_id: number;
+}
+
 /** A mandate from the `/due` list: the chargeable subset of a mandate. */
 export interface DueMandateRow {
   id: number;
@@ -89,18 +100,119 @@ export interface DueMandateRow {
   merchant: string;
   next_charge: number;
   amount: string;
+  /**
+   * Whether the last known vault balance covers this charge.
+   *
+   * The balance is the one the indexer last saw, so it can be behind the
+   * chain; the keeper reads the balance from the contract before it settles.
+   * A subscriber the projection has never seen holds nothing, so its
+   * mandates are reported as not funded.
+   */
+  funded: boolean;
 }
 
 export interface PlanPage {
   plans: PlanRow[];
+  /** Opaque cursor to fetch the page after this one; null on the final page. */
+  nextCursor: string | null;
+}
+
+/** Per-plan statistics for comparing plans at a glance. */
+export interface PlanStatsResponse {
+  planId: number;
+  /** Mandates with status `Active`. */
+  activeMandates: number;
+  /** All mandates for this plan, any status. */
+  totalMandates: number;
+  /** Mandates with status `Cancelled`. */
+  cancellations: number;
+  /** String sum of settled charge amounts, token's smallest unit. */
+  totalCollected: string;
+  /** Settled charges across all mandates of this plan. */
+  totalCharges: number;
+  /** Mean settled charges per mandate (plain division; 0 when no mandates). */
+  averageChargesPerMandate: number;
 }
 
 export interface MandatePage {
   mandates: MandateRow[];
+  /** Opaque cursor to fetch the page after this one; null on the final page. */
+  nextCursor: string | null;
 }
 
 export interface ChargePage {
   charges: ChargeRow[];
+}
+
+export interface VaultBalance {
+  token: string;
+  /** Latest on-chain balance in the token's smallest unit. */
+  balance: string;
+  ledger: number;
+}
+
+export interface VaultEventRow {
+  tx_hash: string;
+  kind: string;
+  user: string;
+  token: string;
+  counterparty: string | null;
+  /** Event amount in the token's smallest unit. */
+  amount: string;
+  /** Post-event balance in the token's smallest unit. */
+  balance: string;
+  ledger: number;
+}
+
+export interface VaultBalancePage {
+  address: string;
+  balances: VaultBalance[];
+}
+
+export interface VaultEventPage {
+  address: string;
+  events: VaultEventRow[];
+}
+
+export interface ProtocolFeeChange {
+  tx_hash: string;
+  old_fee_bps: number;
+  new_fee_bps: number;
+  ledger: number;
+}
+
+export interface ProtocolResponse {
+  /** Null until a fee_changed event has been indexed. */
+  fee_bps: number | null;
+  history: ProtocolFeeChange[];
+  /** The latest code version of each contract that has been upgraded. */
+  contract_versions: { contract_id: string; wasm_hash: string; ledger: number }[];
+}
+
+export interface KeeperPassSummary {
+  time: number;
+  attempted: number;
+  settled: number;
+  failures: { mandateId: number; error: string }[];
+  /**
+   * Mandates the keeper did not try to settle because the subscriber's vault
+   * could not cover the charge. Every amount is a decimal string in the
+   * token's smallest unit.
+   */
+  skipped?: {
+    mandateId: number;
+    /** The amount the charge needs. */
+    required: string;
+    /** The balance the vault holds. */
+    balance: string;
+    /** What is missing. */
+    shortfall: string;
+  }[];
+  backoff: { mandateId: number; failures: number; retryAt: number; retryIn: number }[];
+}
+
+export interface KeeperHistoryResponse {
+  passes: KeeperPassSummary[];
 }
 
 export interface DuePage {
@@ -144,6 +256,93 @@ export interface SubscriberSummary {
   totalPaid: string;
 }
 
+/** One subscriber of a merchant, grouped across all of that subscriber's mandates with the merchant. */
+export interface MerchantSubscriber {
+  /** Subscriber address. */
+  subscriber: string;
+  /** Distinct mandates this subscriber holds with this merchant. */
+  mandateCount: number;
+  /** Charges settled from this subscriber to this merchant. */
+  chargeCount: number;
+  /** Lifetime value: gross amount collected from this subscriber, token's smallest unit. */
+  totalCollected: string;
+}
+
+export interface MerchantSubscribersResponse {
+  merchant: string;
+  /** Subscribers with at least one mandate, ordered by lifetime value descending. */
+  subscribers: MerchantSubscriber[];
+}
+
+/** The time buckets a churn report can be grouped by. */
+export type ChurnBucketSize = "day" | "week" | "month";
+
+/** One bucket of a merchant's churn report. */
+export interface ChurnBucket {
+  /**
+   * The bucket's label: `2025-01` for a month, `2025-01-15` for a day, and
+   * the Monday's date (`2025-01-13`) for a week. All in UTC.
+   */
+  bucket: string;
+  /** Mandates that started in the bucket. */
+  started: number;
+  /** Mandates the subscriber cancelled in the bucket. */
+  cancelled: number;
+  /** Mandates the merchant ended in the bucket. */
+  ended: number;
+  /** Mandates that completed their full charge count in the bucket. */
+  completed: number;
+  /** `started` minus the departures: the net growth of the mandate base. */
+  net: number;
+}
+
+export interface MerchantChurnResponse {
+  merchant: string;
+  /** The bucket size the report is grouped by. */
+  bucket: ChurnBucketSize;
+  /** The buckets, oldest first. */
+  buckets: ChurnBucket[];
+  /** The same counts summed over every bucket in the report. */
+  totals: Omit<ChurnBucket, "bucket">;
+}
+
+/**
+ * The time buckets a revenue report can be grouped by. The same calendar
+ * periods the churn report uses, so a chart can put both on one axis.
+ */
+export type RevenueBucketSize = ChurnBucketSize;
+
+/** One bucket of a merchant's revenue report. */
+export interface RevenueBucket {
+  /**
+   * The bucket's label: `2025-01-15` for a day, the Monday's date
+   * (`2025-01-13`) for a week, and `2025-01` for a month. All in UTC.
+   */
+  bucket: string;
+  /** Gross collected from subscribers: the charge amount plus the fee. */
+  gross: string;
+  /** The protocol's share of that gross. */
+  fee: string;
+  /** What the merchant kept: gross minus the fee. */
+  net: string;
+  /** Charges settled in the bucket. */
+  charges: number;
+}
+
+export interface MerchantRevenueResponse {
+  merchant: string;
+  /** The bucket size the report is grouped by. */
+  bucket: RevenueBucketSize;
+  /** Start of the requested range in unix seconds; null when unbounded. */
+  from: number | null;
+  /** End of the requested range in unix seconds (exclusive); null when unbounded. */
+  to: number | null;
+  /** The buckets, oldest first. */
+  buckets: RevenueBucket[];
+  /** The same figures summed over every bucket in the report. */
+  totals: Omit<RevenueBucket, "bucket">;
+}
+
 export interface UpcomingCharge {
   mandateId: number;
   merchant: string;
@@ -160,6 +359,97 @@ export interface UpcomingChargesResponse {
   totalUpcoming: string;
   truncated: boolean;
   assumptions: string[];
+}
+
+/** A registered webhook destination for charge events, returned to the
+ *  merchant at registration (including the HMAC signing secret). */
+export interface WebhookRegistration {
+  id: number;
+  merchant: string;
+  url: string;
+  /** HMAC-SHA256 key used to sign delivery requests. */
+  secret: string;
+  active: boolean;
+}
+
+/** A registered webhook as `GET /api/webhooks` lists it: never the secret. */
+export interface WebhookSummary {
+  id: number;
+  merchant: string;
+  url: string;
+  /** The signing secret's last four characters, to tell secrets apart. */
+  secretLast4: string;
+  /** True once deliveries gave up after repeated failures. */
+  failed: boolean;
+  failures: number;
+  /** Unix seconds of the last failed delivery attempt, if any. */
+  lastAttempt: number | null;
+  lastStatus: number | null;
+  /** Unix seconds. */
+  createdAt: number;
+}
+
+export interface WebhookListResponse {
+  merchant: string;
+  webhooks: WebhookSummary[];
+}
+
+/** `POST /api/webhooks/:id/rotate`: the new secret, returned this once. */
+export interface WebhookRotation {
+  id: number;
+  /** HMAC-SHA256 key that signs deliveries from now on. */
+  secret: string;
+  /** Unix seconds until which the previous secret also signs; null when it was dropped at once. */
+  previousSecretExpiresAt: number | null;
+}
+
+/** The state of a delivery after an attempt. */
+export type WebhookDeliveryStatus = "delivered" | "pending" | "failed";
+
+/** `POST /api/webhooks/:id/test`: how the ping's first attempt went. */
+export interface WebhookTestResult {
+  deliveryId: number;
+  /** `pending` means the attempt failed and a retry is scheduled at `nextRetryAt`. */
+  status: WebhookDeliveryStatus;
+  /** The endpoint's HTTP status; null when no response arrived. */
+  statusCode: number | null;
+  latencyMs: number;
+  error: string | null;
+  nextRetryAt: number | null;
+}
+
+/** One delivery attempt, as `GET /api/webhooks/:id/deliveries` lists it. */
+export interface WebhookDelivery {
+  id: number;
+  /** The delivery the attempt belongs to; its retries share it. */
+  deliveryId: number;
+  /** `charge:<tx hash>` or `ping:<uuid>`. */
+  eventId: string;
+  attempt: number;
+  status: WebhookDeliveryStatus;
+  statusCode: number | null;
+  error: string | null;
+  /** Unix seconds of the retry this attempt scheduled; null unless `pending`. */
+  nextRetryAt: number | null;
+  /** Unix seconds. */
+  attemptedAt: number;
+}
+
+export interface WebhookDeliveriesResponse {
+  webhookId: number;
+  deliveries: WebhookDelivery[];
+}
+
+/** `GET /api/auth`: a SEP-10 challenge transaction for the client to sign. */
+export interface AuthChallengeResponse {
+  /** Base64 XDR transaction envelope. */
+  transaction: string;
+  network_passphrase: string;
+}
+
+/** `POST /api/auth`: a SEP-10 JWT, sent as `Authorization: Bearer <token>`. */
+export interface AuthTokenResponse {
+  token: string;
 }
 
 export interface StatsResponse {
@@ -187,11 +477,17 @@ export interface HealthResponse {
     cursor: number;
     latestLedger: number;
     lag: number | null;
+    /** True when the indexer loop is held back at runtime (see /admin/indexer/pause). */
+    paused: boolean;
     freshnessSeconds: number | null;
     lastRunAt: string | null;
     lastError: string | null;
     /** Contract events that failed spec validation since process start. */
     mismatchedEvents: number;
+    /** Reconcile passes run since process start. */
+    reconciliations: number;
+    /** Mandate rows the reconciler has brought back in line with the chain. */
+    corrections: number;
   } | null;
   rpc?: {
     active: string;
@@ -202,9 +498,13 @@ export interface HealthResponse {
     vault: string;
     subscription: string;
   };
+  networks?: Record<string, HealthResponse>;
 }
 
-/** Error bodies are `{ error: <code> }`; codes are stable per endpoint. */
-export interface ApiErrorResponse {
-  error: string;
-}
+/**
+ * Error bodies are the structured envelope `{ error: { code, message, requestId } }`;
+ * `code` is stable per endpoint (see `src/routes/errors.ts` for the closed set
+ * and how to extend it). This replaces the previous `{ error: <code> }` string
+ * body — consumers now read `error.code`.
+ */
+export type { ApiErrorBody as ApiErrorResponse, ApiErrorCode } from "./errors.ts";

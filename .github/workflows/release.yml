@@ -1,0 +1,49 @@
+name: Release
+
+# On a v* tag, build the backend image from the repo Dockerfile and push it to
+# GHCR with the version tag, so operators can pull an image instead of
+# building one. The package is created on first push and starts private;
+# make it public in the package settings if anonymous pulls are wanted.
+on:
+  push:
+    tags: ["v*"]
+
+# The job reads the tagged source and publishes the image. `packages: write`
+# is what lets the token push to the organisation's container registry.
+# `contents: write` is deliberately not granted: the job never pushes to the
+# repository itself, so a compromised action cannot rewrite the tag.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    # Read the tagged source, and publish the image to GHCR. Nothing else.
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/mmm-pay/payflow-backend
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

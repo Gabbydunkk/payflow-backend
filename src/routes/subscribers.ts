@@ -1,6 +1,11 @@
 import { Router } from "express";
 import type { DatabaseSync } from "node:sqlite";
-import type { MandateRow, SubscriberSummary, UpcomingCharge, UpcomingChargesResponse } from "./types.ts";
+import {
+  getSubscriberSummary,
+  listSubscriberUpcomingMandates,
+} from "../lib/queries.ts";
+import { addressSchema, daysSchema, present, validate } from "./validate.ts";
+import type { UpcomingCharge, UpcomingChargesResponse } from "./types.ts";
 
 const DAY_S = 86_400;
 const DEFAULT_FORECAST_DAYS = 30;
@@ -18,20 +23,10 @@ export function subscribersRouter(db: DatabaseSync): Router {
   const r = Router();
 
   r.get("/subscribers/:address/summary", (req, res) => {
-    const address = String(req.params.address);
-    const mandates = db
-      .prepare("SELECT * FROM mandates WHERE subscriber = ? ORDER BY id DESC")
-      .all(address) as unknown as MandateRow[];
-    const paid = db
-      .prepare(
-        "SELECT COALESCE(SUM(CAST(amount AS INTEGER) + CAST(fee AS INTEGER)), 0) AS total FROM charges WHERE subscriber = ?",
-      )
-      .get(address) as { total: number };
-    const body: SubscriberSummary = {
-      subscriber: address,
-      mandates,
-      totalPaid: String(paid.total),
-    };
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const body = getSubscriberSummary(db, address.value);
     res.json(body);
   });
 
@@ -47,25 +42,17 @@ export function subscribersRouter(db: DatabaseSync): Router {
    * occurrences step by `period` while they stay inside `[now, until)`.
    */
   r.get("/subscribers/:address/upcoming", (req, res) => {
-    const subscriber = String(req.params.address);
-    const days = daysOf(req.query.days);
-    const now = Math.floor(Date.now() / 1000);
-    const until = now + days * DAY_S;
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
+    if (!days.ok) return;
 
-    const mandates = db
-      .prepare(
-        `SELECT id, merchant, amount, period, next_charge, charges_made, max_charges
-           FROM mandates WHERE subscriber = ? AND status = 'Active' AND period > 0`,
-      )
-      .all(subscriber) as {
-      id: number;
-      merchant: string;
-      amount: string;
-      period: number;
-      next_charge: number;
-      charges_made: number;
-      max_charges: number;
-    }[];
+    const subscriber = address.value;
+    const window = daysOf(days.value);
+    const now = Math.floor(Date.now() / 1000);
+    const until = now + window * DAY_S;
+
+    const mandates = listSubscriberUpcomingMandates(db, subscriber);
 
     const upcoming: UpcomingCharge[] = [];
     let truncated = false;
@@ -94,7 +81,7 @@ export function subscribersRouter(db: DatabaseSync): Router {
 
     const body: UpcomingChargesResponse = {
       subscriber,
-      days,
+      days: window,
       now,
       until,
       upcoming,

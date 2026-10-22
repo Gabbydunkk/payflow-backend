@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { test, describe } from "node:test";
+import { test, describe, mock } from "node:test";
 import { nativeToScVal, rpc } from "@stellar/stellar-sdk";
 import { openDatabase, readCursor, writeCursor } from "../src/lib/db.ts";
 import { Indexer, type IndexerRpc } from "../src/indexer.ts";
 import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { drain, every, serial } from "../src/lib/loop.ts";
-import type { Config } from "../src/config.ts";
+import { logger } from "../src/lib/logger.ts";
+import type { Archive } from "../src/lib/stellar.ts";
+import type { Config, NetworkConfig } from "../src/config.ts";
 
 const MERCHANT = "GB343X4K4TIYARSAAQZ55RIZY2YLFNOQCM3LNQSRBV56TMVGIF55WCOH";
 const SUBSCRIBER = "GAIJKXL3Q45ZR32QRDVPUDD4DPLT5GYCHJFESQPHHWJRYX4YZCG25JJR";
@@ -22,6 +24,21 @@ const config = {
   KEEPER_SECRET: "SBK2VIYYSVG76E7VC3QHYARNFLY2EAQXDHRC7BMXBBGIFG74ARPRMNQM",
 } as unknown as Config;
 
+/** The indexer reads the network it was constructed with. */
+function net(overrides: Partial<NetworkConfig> = {}): NetworkConfig {
+  return {
+    name: "testnet",
+    rpcUrl: "https://rpc.invalid",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    planRegistryId: CONTRACT,
+    vaultId: CONTRACT,
+    subscriptionId: CONTRACT,
+    startLedger: 0,
+    databasePath: ":memory:",
+    ...overrides,
+  };
+}
+
 /** A raw RPC event for a plan_created in `ledger`. */
 function rawEvent(ledger: number, planId: number): rpc.Api.EventResponse {
   return {
@@ -35,6 +52,31 @@ function rawEvent(ledger: number, planId: number): rpc.Api.EventResponse {
     value: nativeToScVal({ token: CONTRACT, amount: 10n, period: 60n, name: `p${planId}` }, {
       type: { token: ["symbol", "address"], amount: ["symbol", "i128"], period: ["symbol", "u64"], name: ["symbol", "string"] },
     }),
+  } as unknown as rpc.Api.EventResponse;
+}
+
+function rawChargedEvent(ledger: number): rpc.Api.EventResponse {
+  return {
+    ledger,
+    txHash: "tx-stream-pass",
+    contractId: CONTRACT,
+    topic: [
+      nativeToScVal("charged", { type: "symbol" }),
+      nativeToScVal(1n, { type: "u64" }),
+      nativeToScVal(SUBSCRIBER, { type: "address" }),
+      nativeToScVal(MERCHANT, { type: "address" }),
+    ],
+    value: nativeToScVal(
+      { amount: 90n, fee: 10n, charges_made: 1n, next_charge: 1_700_000_060n },
+      {
+        type: {
+          amount: ["symbol", "i128"],
+          fee: ["symbol", "i128"],
+          charges_made: ["symbol", "u32"],
+          next_charge: ["symbol", "u64"],
+        },
+      },
+    ),
   } as unknown as rpc.Api.EventResponse;
 }
 
@@ -101,6 +143,39 @@ function plans(db: ReturnType<typeof openDatabase>): number[] {
 }
 
 describe("indexer sync", () => {
+  test("emits a projected event during the same RPC pass", async () => {
+    const db = openDatabase(":memory:");
+    const chain: FakeChain = {
+      latest: 101,
+      oldest: 100,
+      events: [rawChargedEvent(100)],
+      calls: [],
+    };
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 100 }));
+    ix.apply({
+      name: "subscribed",
+      contractId: CONTRACT,
+      ledger: 99,
+      txHash: "tx-subscribe-pass",
+      topics: [1n, SUBSCRIBER, MERCHANT],
+      data: {
+        plan_id: 1n,
+        amount: 100n,
+        period: 60n,
+        next_charge: 1_700_000_000n,
+      },
+    });
+    const received: string[] = [];
+    ix.events.on("applied", (event: { name: string }) => received.push(event.name));
+
+    const result = await ix.tick();
+
+    assert.equal(result.applied, 1);
+    assert.deepEqual(received, ["charged"]);
+    assert.equal(result.cursor, 101);
+    db.close();
+  });
+
   test("starts at the configured ledger and stops before the latest one", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = {
@@ -109,7 +184,7 @@ describe("indexer sync", () => {
       events: [rawEvent(900, 1), rawEvent(1_050, 2), rawEvent(1_100, 3)],
       calls: [],
     };
-    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 1_000 });
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 1_000 }));
 
     const r = await ix.tick();
 
@@ -123,17 +198,80 @@ describe("indexer sync", () => {
   test("with no start configured, begins at the oldest ledger RPC serves", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = { latest: 700, oldest: 600, events: [rawEvent(650, 1)], calls: [] };
-    await new Indexer(db, fakeRpc(chain), config).tick();
+    await new Indexer(db, fakeRpc(chain), net()).tick();
     assert.equal(chain.calls[0]!.startLedger, 600);
     assert.deepEqual(plans(db), [1]);
   });
 
-  test("a cursor that fell out of retention restarts at the oldest ledger", async () => {
+  test("a cursor that fell out of retention restarts at the oldest ledger when gaps are allowed", async () => {
     const db = openDatabase(":memory:");
     writeCursor(db, 100);
     const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
-    await new Indexer(db, fakeRpc(chain), config).tick();
+    await new Indexer(db, fakeRpc(chain), net({ allowGaps: true } as never)).tick();
     assert.equal(chain.calls[0]!.startLedger, 600);
+    assert.equal(readCursor(db, 0), 700);
+    db.close();
+  });
+
+  test("refuses to advance the cursor past a gap without ALLOW_GAPS", async () => {
+    const db = openDatabase(":memory:");
+    writeCursor(db, 100);
+    const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
+    const ix = new Indexer(db, fakeRpc(chain) as never, net() as never);
+    const warnings: unknown[][] = [];
+    mock.method(logger, "warn", (...args: unknown[]): void => {
+      warnings.push(args);
+    });
+    try {
+      await assert.rejects(() => ix.tick(), /missing ledgers/);
+      assert.equal(readCursor(db, 0), 100, "the cursor does not advance past the gap");
+      assert.ok(
+        warnings.some((args) => {
+          const obj = args[0] as { gapFrom?: number; gapTo?: number } | undefined;
+          return obj?.gapFrom === 100 && obj?.gapTo === 600;
+        }),
+        "the warning names the exact missing ledger range",
+      );
+      // The failure is logged and retried on the next pass: the loop is not
+      // crashed, so a second tick fails the same way instead of advancing.
+      await assert.rejects(() => ix.tick(), /missing ledgers/);
+      assert.equal(readCursor(db, 0), 100);
+    } finally {
+      mock.restoreAll();
+      db.close();
+    }
+  });
+
+  test("backfills a gap from the archive before indexing continues", async () => {
+    const db = openDatabase(":memory:");
+    writeCursor(db, 100);
+    const chain: FakeChain = { latest: 700, oldest: 600, events: [], calls: [] };
+    const archiveEvents = [rawEvent(150, 1), rawEvent(400, 2)];
+    const archive: Archive = {
+      getEvents: async (req: Record<string, unknown>) => {
+        let pool: rpc.Api.EventResponse[];
+        if (req.cursor !== undefined) {
+          pool = archiveEvents.slice(Number(req.cursor));
+        } else {
+          const start = req.startLedger as number;
+          const end = (req.endLedger as number | undefined) ?? Infinity;
+          pool = archiveEvents.filter((e) => e.ledger >= start && e.ledger < end);
+        }
+        const page = pool.slice(0, Math.min(200, req.limit as number));
+        return {
+          events: page,
+          cursor: page.length ? String(archiveEvents.indexOf(page[page.length - 1]!) + 1) : undefined,
+        } as never;
+      },
+    };
+    const ix = new Indexer(db, fakeRpc(chain) as never, net() as never, undefined, archive);
+
+    const r = await ix.tick();
+
+    assert.deepEqual(plans(db), [1, 2], "the archive's events are projected");
+    assert.equal(r.cursor, 700, "indexing continues after the gap is backfilled");
+    assert.equal(readCursor(db, 0), 700);
+    db.close();
   });
 
   test("follows cursor pages but ignores events past the range end", async () => {
@@ -146,7 +284,7 @@ describe("indexer sync", () => {
       events: [rawEvent(10, 1), rawEvent(11, 2), rawEvent(12, 3), rawEvent(15_000, 4)],
       calls: [],
     };
-    const ix = new Indexer(db, fakeRpc(chain, 2), { ...config, INDEXER_START_LEDGER: 10 });
+    const ix = new Indexer(db, fakeRpc(chain, 2), net({ startLedger: 10 }));
 
     const r = await ix.tick();
 
@@ -229,7 +367,7 @@ describe("indexer sync", () => {
       events: [rawEvent(10, 1), rawEvent(15_000, 2), rawEvent(19_999, 3)],
       calls: [],
     };
-    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 10 });
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 10 }));
 
     await ix.catchUp();
 
@@ -241,7 +379,7 @@ describe("indexer sync", () => {
   test("replaying a range does not duplicate rows", async () => {
     const db = openDatabase(":memory:");
     const chain: FakeChain = { latest: 200, oldest: 1, events: [rawEvent(150, 1)], calls: [] };
-    const ix = new Indexer(db, fakeRpc(chain), { ...config, INDEXER_START_LEDGER: 100 });
+    const ix = new Indexer(db, fakeRpc(chain), net({ startLedger: 100 }));
     await ix.tick();
     writeCursor(db, 100);
     await ix.tick();
@@ -264,7 +402,7 @@ describe("indexer sync", () => {
     const r = await ix.tick();
     assert.equal(r.cursor, 1_100);
     assert.equal(ix.status.lastLedgerCloseTime, nowSec - 15);
-    assert.ok(ix.status.freshnessSeconds !== null && ix.status.freshnessSeconds >= 15);
+    assert.ok(ix.status.freshnessSeconds != null && ix.status.freshnessSeconds >= 15);
   });
 });
 

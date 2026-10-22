@@ -1,53 +1,104 @@
-import { loadConfig } from "./config.ts";
+import { loadConfig, networkConfigs } from "./config.ts";
 import { openDatabase } from "./lib/db.ts";
-import { makeRpc } from "./lib/stellar.ts";
+import { acquireLock } from "./lib/lock.ts";
+import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
+import { WebhookDispatcher } from "./lib/webhooks.ts";
+import { sep10For } from "./routes/auth.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
 import { Keeper } from "./keeper.ts";
 import type { AdminHooks } from "./routes/admin.ts";
 import { logger } from "./lib/logger.ts";
 import { drain, every, serial, type Loop } from "./lib/loop.ts";
+import { Reconciler } from "./reconcile.ts";
 import { initTelemetry, withSpan } from "./lib/telemetry.ts";
 
 const config = loadConfig();
 const stopTelemetry = initTelemetry(config.OTEL_EXPORTER_OTLP_ENDPOINT);
-const db = openDatabase(config.DATABASE_PATH);
-const server = makeRpc(config);
+const networks = networkConfigs(config);
 
-// Token metadata is read from the token contract itself through the same RPC
-// server the indexer uses, cached by contract id (see lib/tokens.ts).
-const tokens = new TokenMetadataService(
-  makeSimulationReader(server, config.NETWORK_PASSPHRASE),
-  { networkPassphrase: config.NETWORK_PASSPHRASE },
-);
+// One indexer and one database per network, so cursors and projections never
+// mix. `runtimes[0]` is the default network: it serves the unprefixed routes.
+const runtimes = networks.map((network) => {
+  // Mark the database as in use so `npm run reindex` refuses to move it away
+  // underneath us; a second server on the same file fails here too.
+  const releaseLock = acquireLock(network.databasePath);
+  const db = openDatabase(network.databasePath);
+  const server = makeRpc(network);
+  // A full-history archive backfills the gap between the stored cursor and
+  // the oldest ledger the RPC still serves, so an outage longer than RPC
+  // retention does not silently shrink the projection.
+  const archive = network.archiveUrl ? new HttpArchive(network.archiveUrl) : undefined;
+  const indexer = new Indexer(db, server, network, undefined, archive);
+  const dispatcher = new WebhookDispatcher({
+    db,
+    events: indexer.events,
+    secretOverlapSeconds: config.WEBHOOK_SECRET_OVERLAP_S,
+  });
+  dispatcher.bind(indexer.events);
+  const runPass = serial(async () => {
+    try {
+      const r = await withSpan(`indexer.pass.${network.name}`, () => indexer.tick());
+      indexer.status.lastRunAt = Date.now();
+      indexer.status.lastError = null;
+      if (r.applied > 0) {
+        logger.info({ network: network.name, events: r.applied, cursor: r.cursor }, "indexed");
+      }
+      return r;
+    } catch (err) {
+      indexer.status.lastError = err instanceof Error ? err.message : String(err);
+      logger.error({ err, network: network.name }, "indexer pass failed");
+      throw err;
+    }
+  });
+  // Token metadata is read from the token contract itself through the same
+  // RPC failover the indexer uses, cached by contract id (see lib/tokens.ts).
+  const tokens = new TokenMetadataService(
+    makeSimulationReader(server, network.networkPassphrase),
+    { networkPassphrase: network.networkPassphrase },
+  );
+  // Re-reads a sample of active mandates from the contract and repairs any
+  // drift the indexer missed (RPC gap, bug, outage mid-range).
+  const reconciler = new Reconciler(
+    db,
+    server,
+    network.subscriptionId,
+    network.networkPassphrase,
+    config.RECONCILE_SAMPLE_SIZE,
+    // A repaired mandate changes the merchant's summary; evict it so the API
+    // serves the corrected projection instead of a stale cache entry.
+    (merchant) => indexer.merchantCache.invalidate(merchant),
+  );
+  // SEP-10 sign-in reads the signing account's signers through the same RPC.
+  const auth = sep10For(config, network, server);
+  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth };
+});
+const defaultRuntime = runtimes[0]!;
+// Release the database locks however the process ends; a crash that skips
+// this leaves a stale lock, which the next taker detects by its dead PID.
+process.on("exit", () => {
+  for (const rt of runtimes) rt.releaseLock();
+});
 
-const indexer = new Indexer(db, server, config);
-const keeper = config.KEEPER_ENABLED ? new Keeper(db, server, config) : undefined;
+const keeper = config.KEEPER_ENABLED
+  ? new Keeper(defaultRuntime.db, defaultRuntime.server, config)
+  : undefined;
 const activeKeeper = keeper;
 if (keeper) {
-  logger.info({ keeper: keeper.publicKey }, "keeper enabled");
+  if (runtimes.length > 1) {
+    logger.warn(
+      { network: defaultRuntime.network.name },
+      "keeper settles the default network only",
+    );
+  }
+  logger.info(
+    { keeper: keeper.publicKey, channels: keeper.channelCount, network: defaultRuntime.network.name },
+    "keeper enabled",
+  );
 } else {
   logger.info("keeper disabled (KEEPER_ENABLED=false)");
 }
-
-// Each runner is serialized, and the scheduled loop and the /admin trigger
-// share it: a pass can take longer than the interval while backfilling, and
-// overlapping passes would race on the cursor and, for the keeper, on the
-// account sequence number.
-const runIndexerPass = serial(async () => {
-  try {
-    const r = await withSpan("indexer.pass", () => indexer.tick());
-    indexer.status.lastRunAt = Date.now();
-    indexer.status.lastError = null;
-    if (r.applied > 0) logger.info({ events: r.applied, cursor: r.cursor }, "indexed");
-    return r;
-  } catch (err) {
-    indexer.status.lastError = err instanceof Error ? err.message : String(err);
-    logger.error({ err }, "indexer pass failed");
-    throw err;
-  }
-});
 
 const runKeeperPass = keeper
   ? serial(async () => {
@@ -63,36 +114,103 @@ const runKeeperPass = keeper
     })
   : undefined;
 
-const adminHooks: AdminHooks = { reindex: () => runIndexerPass() };
+const adminHooks: AdminHooks = {
+  reindex: async () => {
+    const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
+    return results[0]!;
+  },
+  // Runtime indexer control: hold every network's loop back without taking the
+  // API down. While paused, each tick is a no-op, so the cursor and projection
+  // are preserved and /health reports `indexer.paused: true`.
+  pauseIndexer: () => {
+    for (const rt of runtimes) rt.indexer.pause();
+    return null;
+  },
+  resumeIndexer: () => {
+    for (const rt of runtimes) rt.indexer.resume();
+    return null;
+  },
+};
 if (keeper && runKeeperPass) {
   adminHooks.keeperPass = () => runKeeperPass();
   adminHooks.keeperBackoff = () => keeper.backoffList();
+  adminHooks.keeperHistory = () => keeper.passHistory();
 }
 
 const app = createApp(
-  db,
+  runtimes.map((rt) => ({
+    config: rt.network,
+    db: rt.db,
+    events: rt.indexer.events,
+    indexer: rt.indexer.status,
+    summaryCache: rt.indexer.merchantCache,
+    rpc: rt.server,
+    tokens: rt.tokens,
+    webhooks: rt.dispatcher,
+    auth: rt.auth,
+  })),
   config,
-  indexer.status,
-  indexer.merchantCache,
-  server,
   adminHooks,
-  tokens,
 );
+
 const http = app.listen(config.PORT, () => {
-  logger.info({ port: config.PORT, network: config.STELLAR_NETWORK }, "api listening");
+  logger.info(
+    { port: config.PORT, networks: networks.map((n) => n.name) },
+    "api listening",
+  );
 });
 
 const loops: Loop[] = [];
 
-loops.push(
-  every(config.INDEXER_INTERVAL_MS, async () => {
-    try {
-      await runIndexerPass();
-    } catch {
-      // Handled in runIndexerPass
-    }
-  }),
-);
+for (const rt of runtimes) {
+  loops.push(
+    every(config.INDEXER_INTERVAL_MS, async () => {
+      try {
+        await rt.runPass();
+      } catch {
+        // Handled in runPass
+      }
+    }),
+  );
+  loops.push(
+    every(config.RECONCILE_INTERVAL_MS, async () => {
+      try {
+        const r = await rt.reconciler.tick();
+        rt.indexer.status.reconciliations = (rt.indexer.status.reconciliations ?? 0) + 1;
+        rt.indexer.status.corrections = (rt.indexer.status.corrections ?? 0) + r.corrections;
+        if (r.errors > 0) {
+          logger.warn(
+            {
+              network: rt.network.name,
+              sampled: r.sampled,
+              onChain: r.onChain,
+              errors: r.errors,
+              lastError: r.lastError,
+            },
+            "reconcile pass had failures",
+          );
+        }
+        if (r.corrections > 0) {
+          logger.info(
+            { network: rt.network.name, corrections: r.corrections, sampled: r.sampled },
+            "reconcile pass corrected drift",
+          );
+        }
+      } catch {
+        // Reconciler.tick logs and swallows its own failures; this is defensive.
+      }
+    }),
+    // Retry undelivered webhooks on their own cadence so a slow or silent
+    // indexer loop still makes delivery progress.
+    every(5_000, async () => {
+      try {
+        await rt.dispatcher.retryDue(Math.floor(Date.now() / 1000));
+      } catch {
+        // retryDue logs its own failures; the loop keeps going.
+      }
+    }),
+  );
+}
 
 if (runKeeperPass) {
   loops.push(
@@ -144,7 +262,10 @@ async function shutdown(signal: string): Promise<void> {
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
   http.close(() => {
-    db.close();
+    for (const rt of runtimes) {
+      rt.db.close();
+      rt.releaseLock();
+    }
     process.exit(0);
   });
 }

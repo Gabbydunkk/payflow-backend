@@ -7,6 +7,118 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **SEP-10 sign-in for merchant-only endpoints (#141).** `GET /api/auth` issues
+  a SEP-10 challenge signed with `SEP10_SIGNING_KEY`, and `POST /api/auth`
+  verifies the signed challenge and returns a short-lived JWT. Webhook routes
+  accept it as a bearer token beside their signed messages.
+- **Webhook delivery history (#140).** Every delivery attempt is logged, the
+  newest 100 per webhook, and served at `GET /api/webhooks/:id/deliveries`.
+- **Webhook secret rotation (#139).** `POST /api/webhooks/:id/rotate` returns a
+  new secret once; both secrets sign for `WEBHOOK_SECRET_OVERLAP_S`.
+- **Webhook test events (#138).** `POST /api/webhooks/:id/test` delivers a
+  signed `ping` through the normal path and reports status code and latency.
+- **A coverage report with a minimum threshold (#49).** `npm run test:coverage`
+  runs the tests with Node's own coverage and writes an lcov report to
+  `lcov.info`, which CI uploads as an artifact. The `coverage` job
+  fails when the line coverage of `src/` falls below the threshold
+  `--test-coverage-lines` sets: 94%, the measured baseline of 96.63% minus
+  two percentage points. No coverage tool is added as a dependency — the test
+  runner already knows how to measure itself.
+- **An operator CLI (#41).** `npm run cli -- <command>` answers the questions an
+  incident asks — is the projection current, what does mandate 42 look like,
+  what is due, settle this mandate, rebuild the projection — without an ad-hoc
+  script or a hand-written SQL query. `status`, `mandate` and `due` read the
+  projection only and need no network; `charge` and `reindex` use the keeper and
+  the indexer themselves, so the CLI cannot drift from what the service does.
+  Every command has its own `--help`. The two commands that change something
+  refuse to run until `--yes` says so, amounts are printed as the decimal
+  strings the projection stores, and no secret is ever printed. `status --api`
+  adds the running instance's verdict and the live indexer's health — whether
+  it is paused, what it last failed on, how many events it rejected — which the
+  projection file on its own does not hold. `reindex --from` refuses to move
+  the cursor *forwards*, because the ledgers in between would never be applied;
+  `--skip-ahead` is how an operator accepts that gap on purpose.
+- **An API changelog and a deprecation policy (#172).** `API_CHANGELOG.md`
+  records what changed in the HTTP API apart from the service's own changelog,
+  and states how long a deprecated field or route keeps working: one minor
+  release of notice, announced in the response with `Deprecation` and `Sunset`
+  headers and in the OpenAPI document with `deprecated: true`. The document's
+  `externalDocs` links the file, and a test reads it to prove the link and the
+  policy are both there.
+- **Keeper dry-run mode (#38).** `KEEPER_DRY_RUN=true` makes a settlement pass
+  rehearse instead of settle: every due charge is built and simulated against
+  the RPC exactly as a real pass would — account lookup, inclusion fee,
+  vault-balance skips and key rotation included — but the keeper stops after
+  the simulation: nothing is signed, `sendTransaction` is never called, and
+  backoff, pass history and metrics are left untouched. Each mandate answers
+  `simulated`, carrying the simulation's error when the charge would fail, so
+  an operator can exercise a first run on a new deployment before it costs a
+  fee. The new variable is in the README's configuration table.
+- **An OpenAPI description of the API (#7).** `GET /api/openapi.json` serves an
+  OpenAPI 3.1 document covering every route and `/health`, with the parameters
+  each route takes, the responses it answers and the schema of each body.
+  Amounts are documented as decimal strings in the token's smallest unit, so a
+  generated client knows not to read them as numbers. A test compares the
+  document with the routes Express registers, so a route that is added without
+  being documented fails the build.
+- **Prometheus metrics (#9).** With `METRICS_ENABLED=true` the service serves
+  `/metrics` in the Prometheus text format: gauges for the indexer's cursor,
+  the latest ledger and the lag, and counters for the events applied, the
+  charges settled, the charges failed and the keeper passes. The endpoint is
+  off by default; the new variable is in `.env.example` and the README's
+  configuration table.
+- **The keeper skips mandates the vault cannot cover (#8).** Before it settles
+  anything, the keeper reads `vault.balance(subscriber, token)` from the
+  contract — a read-only simulation, no transaction and no fee — and skips a
+  mandate whose amount the vault does not hold, logging the shortfall once per
+  pass. A balance that cannot be read is not treated as a shortfall, so an RPC
+  hiccup never stops a settlement. `GET /api/due` gained a `funded` flag per
+  mandate, computed from the last vault balance the indexer saw.
+- **Merchant revenue over time (#12).** `GET /api/merchants/:address/revenue`
+  reports what a merchant took in, what the protocol took and what was left,
+  in `day`, `week` or `month` buckets: `gross`, `fee` and `net` per bucket,
+  all decimal strings in the token's smallest unit. The buckets come from the
+  close time of the ledger each charge was emitted in, so the report is the
+  chain's own history and replaying a ledger range leaves it unchanged. The
+  typed client gained `merchantRevenue`.
+- **Request validation (#14).** Query and path parameters are validated with
+  zod instead of being cast: an address must be a real Stellar StrKey (an
+  account `G...` or a contract `C...`, checksum included), a `status` must be
+  one the projection writes, an id must be a positive integer and a `limit`,
+  `days` or `bucket` must be a value the API knows. A bad one is answered
+  with `400 invalid_request` and an `error.details` list naming it, so a
+  client bug looks like an error instead of an empty page. Valid requests are
+  unaffected.
+- **Local development with Docker (#11).** `docker-compose.yml` runs the
+  service from the same `Dockerfile` the deployment uses, reads `.env` and
+  keeps the projection on a named volume, so `docker compose up` is enough to
+  run the backend. CI builds the image (and pushes nothing), so a Dockerfile
+  that no longer builds is caught before it reaches a deployment.
+- **Parallel settlement with keeper channel accounts (#36).** Extra signing
+  accounts listed in `KEEPER_CHANNEL_SECRETS` become parallel settlement
+  channels: due mandates are pulled from one shared queue by one worker per
+  channel, so every account sequences its own transactions (paying its own
+  fees) while channels settle concurrently — a single key manages only a few
+  charges per minute and large merchants were billed hours late. A channel
+  whose account cannot pay is skipped for the pass (logged by public key) and
+  its share settles through the live channels instead of backing off against
+  a dead key; with one channel the pass is the old sequential behaviour and
+  makes no extra RPC call. A fee-bump design was rejected because a fee bump
+  consumes the *fee source's* sequence number, which would serialize every
+  transaction against the main key again. Tested with three channels: no
+  sequence-number collisions, all channels sign, results keep due order.
+- **Merchant churn metrics (#30).** `GET /api/merchants/:address/churn` reports
+  how a merchant's mandate base moved over time: mandates started, cancelled
+  by the subscriber, ended by the merchant, and completed, plus the net, in
+  `day`, `week` or `month` buckets. The indexer records each lifecycle event
+  in a new `mandate_events` log stamped with the ledger's close time, so the
+  buckets are the chain's calendar and not the indexer's wall clock, and
+  replaying a ledger range leaves the report unchanged.
+- **Per-plan statistics (#29).** `GET /api/plans/:id/stats` reports a plan's
+  active and total mandates, cancellations, gross amount collected and the
+  average number of settled charges per mandate, so merchants can compare
+  plans side by side. The collected total stays a decimal string in the
+  token's smallest unit, and an unknown plan is `404 plan_not_found`.
 - **Zero-downtime keeper key rotation (#71).** The keeper accepts a standby
   key in `KEEPER_SECRET_NEXT`: if the active key's source account is unusable
   it rotates mid-pass and retries the same mandate, and after a pass settles
@@ -68,21 +180,114 @@ All notable changes to payflow-backend. The format follows
   `ADMIN_TOKEN` is set, require `Authorization: Bearer`, and the token is
   compared in constant time. Triggered passes queue behind any pass already
   running rather than overlapping it.
+- **Dependabot and an audit gate**: weekly npm and GitHub Actions updates, and
+  CI now fails on high or critical advisories in production dependencies
+  (`npm audit --omit=dev --audit-level=high`).
+- **Container image on release**: pushing a `v*` tag builds the Dockerfile and
+  publishes `ghcr.io/mmm-pay/payflow-backend:<version>` to GHCR.
+- **A Dockerfile and Fly.io configuration**: a multi-stage image that runs the
+  API and indexer as a non-root user, and a `fly.toml` with a volume for the
+  SQLite file, `/health` checks and autostop.
+- **Several networks from one instance**: `NETWORKS` lists extra networks
+  beside the default one. Each gets its own indexer, cursor and SQLite
+  database, and its routes under `/api/<name>/...`; unprefixed routes keep
+  serving the default network unchanged. `/health` reports every network.
+- A route test suite for two configured networks.
+- **Cursor pagination for list endpoints (#3).** `GET /api/plans` and
+  `GET /api/mandates` accept an opaque `?cursor=` and return `nextCursor`,
+  keyed on the primary key (`id DESC`) instead of an offset, so clients can
+  page past the 200-row cap. `nextCursor` is `null` on the final page, the
+  existing `limit` behaviour is unchanged (capped at 200), and an invalid
+  cursor is answered `400 invalid_request`. The typed client gained `cursor`
+  on `PlansQuery` and `MandatesQuery`, and the OpenAPI document gained the
+  parameter and `nextCursor` on both pages.
+- **Full-history archive backfill (#4).** The indexer detects when the stored
+  cursor falls behind the oldest ledger the RPC still serves, logs a
+  structured warning naming the exact missing ledger range, and refuses to
+  advance the cursor past the gap unless `ALLOW_GAPS=true` is set. With
+  `ARCHIVE_URL` configured, an `HttpArchive` backfills the gap with
+  idempotent event application before indexing continues, so a service
+  offline longer than RPC retention does not silently under-report. Both
+  variables are in `.env.example` and the README's configuration table.
+- **Webhook dispatcher for charge events (#5).** Merchants register a URL
+  with `POST /api/webhooks`, proving control of their Stellar address with an
+  ed25519 signature. Each `charged` event dispatches a signed `POST`
+  (`Payflow-Signature: sha256=<hex>` HMAC, `Idempotency-Key` for at-least-once
+  delivery) per registered webhook. Failing deliveries retry with exponential
+  backoff for at most five attempts before the webhook is marked failed. The
+  indexer's `events` feed drives delivery, and a short-cadence retry pass
+  makes progress between indexer passes.
+- **Replay test against recorded testnet events (#6).** `test/fixtures/replay-events.json`
+  records five real `getEvents` responses from the deployed contracts, and
+  `test/replay.test.ts` replays them through `decodeEvent` and the projection,
+  asserts the resulting database state matches a committed snapshot, and proves
+  that replaying the fixture twice leaves the database unchanged.
 
 ### Changed
 
+- **The indexer's idempotency is tested under random orderings (#48).** The
+  projection was checked against a handful of hand-written replays. A seeded
+  generator now builds a random history across several mandates, plans and
+  vault rows, applies it in ledger order, and applies the same history again
+  as a shuffled, repeated replay; the two projections have to be identical.
+  The seed is part of the test, so a failure is reproducible. The two orderings
+  the projection does not survive — an update that arrives before the row it
+  updates, and a pause that arrives after the unpause that followed it — are
+  pinned down by their own tests, so what the property relies on is written
+  down rather than assumed.
+
+- **The test files are type-checked (#50).** `tsconfig.json` only covered
+  `src/`, so a type error in a test was never reported: it surfaced as a
+  confusing runtime failure, or not at all. A `tsconfig.test.json` now covers
+  `test/` as well, the CI typecheck job runs it, and `npm run typecheck` runs
+  both. The types that were wrong are fixed, not worked around.
+- **A mandate that does not exist has no charges (#10).**
+  `GET /api/mandates/:id/charges` used to answer `200` with an empty list for
+  an unknown id, so "no such mandate" and "no charges yet" looked the same. It
+  now answers `404 mandate_not_found`, like `GET /api/mandates/:id` does.
+- **A charge is stamped with the chain's clock (#13).** `charges.created_at`
+  was the moment the indexer happened to see the charge, so every charge
+  indexed in one backfill shared one timestamp and any time-based view of the
+  history was wrong after a redeploy. It is now the close time of the ledger
+  the charge was emitted in, in unix milliseconds. The row is still written
+  with `INSERT OR IGNORE`, so replaying a ledger range leaves the stored value
+  untouched — which also means a row written before this change keeps the
+  timestamp it was given. A charge whose event carried no close time falls
+  back to the indexer's wall clock, and says so in the log.
+- **Parameters the API does not accept are refused (#14).** `?status=whatever`,
+  `/api/plans/abc`, a mistyped address and a malformed `limit` used to be
+  cast and quietly matched nothing, so a client bug looked like an empty
+  page. They are now `400 invalid_request`, with `error.details` naming the
+  parameter and what was expected. Valid requests are unaffected, and an
+  empty value (`?merchant=`) still means "no filter".
+- **An empty `OTEL_EXPORTER_OTLP_ENDPOINT` means tracing is off.** The shipped
+  `.env.example` leaves the variable blank, and a container that reads that
+  file used to refuse to start over a URL that is not there.
 - **Summary query indexes (#66).** Covering indexes for the merchant and
   subscriber summary aggregates (`mandates(merchant, status, period, amount)`,
   `charges(merchant, amount)`, `charges(subscriber, amount, fee)`) are added
   through the startup migration, so existing databases gain them without a
   rebuild. `EXPLAIN QUERY PLAN` now reports covering-index searches instead
   of table lookups.
-
 - **One router per resource (#74).** `src/routes/index.ts` is split into
   `plans.ts`, `mandates.ts`, `merchants.ts`, `subscribers.ts` and `stats.ts`
   with shared query helpers in `helpers.ts`. No change in behaviour: paths,
   query handling and response shapes are identical and the existing API
   tests pass unchanged.
+
+- **Express 5 (#77).** `express` and `@types/express` move to 5.x. No removed
+  API was in use — no `app.del`, no `res.send(status)`, no wildcard or
+  regex paths for path-to-regexp v8 to reject — so routes and response shapes
+  are untouched and payflow-frontend needs no migration note. What does change
+  is where a failure lands: Express 5 awaits a handler's result and forwards a
+  rejected promise to the error middleware, so an `async` route no longer needs
+  a manual `try`/`catch` to avoid leaving the caller hanging with an unhandled
+  rejection. The four-argument handler in `src/app.ts` is now the single
+  boundary for every failure, is exported as `errorHandler`, hands back errors
+  whose response has already started, and logs `loggableError(err)` (type,
+  message, status, stack) instead of the raw error — `body-parser` hangs the
+  caller's request body off its `SyntaxError`, and that must not reach a log
+  line.
 
 ### Fixed
 
@@ -91,6 +296,12 @@ All notable changes to payflow-backend. The format follows
   several tokens. Revenue and MRR are now also grouped per token in a `tokens`
   array, and the flat fields report the default token (`TOKEN_ID`) when one is
   configured — without one they keep their previous all-token meaning.
+
+### Security
+
+- Patched transitive advisories in `proxy-addr` (critical) and `qs`
+  (moderate) with `npm audit fix`; the production audit is clean.
+
 
 ## [0.2.0] - 2026-10-09
 
@@ -141,4 +352,5 @@ Points at the v0.2.0 contract suite on testnet.
 Event indexer, settlement keeper and read API for the first testnet
 deployment.
 
+[Unreleased]: https://github.com/MMM-pay/payflow-backend/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/MMM-pay/payflow-backend/releases/tag/v0.2.0
